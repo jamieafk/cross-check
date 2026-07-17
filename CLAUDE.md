@@ -29,4 +29,6 @@ Cross-agent skill (Claude Code + Codex) that runs extensive code reviews and adv
 
 ## Testing
 
-End-to-end: create a temp git repo, seed a real bug in a diff, run `node skill/scripts/fable-check.mjs review --effort low`, confirm a structured report finds the bug. Each run costs real Fable 5 usage — use `--effort low` for tests.
+- **Offline first (free):** `node --test test/*.test.mjs` — covers structured-output extraction, review normalization, argv handling, target selection (temp git repo), dead-worker reconciliation, and CLI guards. Run after any change to parsing, prompts, or job state. The script exports its pure functions and only runs `main()` when invoked directly; `FABLE_CHECK_STATE_DIR` redirects job state for tests.
+- **`--dry-run`** on `review`/`ask` prints the resolved target + assembled prompt without calling claude — free way to eyeball prompt changes.
+- **End-to-end (costs real Fable 5 usage):** create a temp git repo, seed a real bug in a diff, run `node skill/scripts/fable-check.mjs review --effort low`, confirm a structured report finds the bug. Use `--effort low`.

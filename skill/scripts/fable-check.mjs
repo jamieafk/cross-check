@@ -14,7 +14,9 @@ import { fileURLToPath } from "node:url";
 
 const SKILL_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const SCHEMA_PATH = path.join(SKILL_ROOT, "schemas", "review-output.schema.json");
-const STATE_ROOT = path.join(os.homedir(), ".fable-check", "jobs");
+// FABLE_CHECK_STATE_DIR exists so tests can run against a throwaway state dir.
+const STATE_ROOT =
+  process.env.FABLE_CHECK_STATE_DIR || path.join(os.homedir(), ".fable-check", "jobs");
 
 const DEFAULT_MODEL = "claude-fable-5";
 const DEFAULT_EFFORT = "xhigh";
@@ -418,11 +420,15 @@ function killActiveClaudeChildren() {
   }
 }
 
-for (const signal of ["SIGTERM", "SIGINT"]) {
-  process.on(signal, () => {
-    killActiveClaudeChildren();
-    process.exit(signal === "SIGINT" ? 130 : 143);
-  });
+// Only when running as the CLI — importers (tests) must not inherit handlers
+// that call process.exit. isDirectInvocation is hoisted from the file bottom.
+if (isDirectInvocation()) {
+  for (const signal of ["SIGTERM", "SIGINT"]) {
+    process.on(signal, () => {
+      killActiveClaudeChildren();
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    });
+  }
 }
 
 // Runs the claude CLI with stream-json output so progress is observable while
@@ -669,11 +675,18 @@ function formatLineRange(finding) {
   return `:${finding.line_start}-${finding.line_end}`;
 }
 
+function jobStampLine(meta) {
+  if (!meta.jobId) return null;
+  return `Job: ${meta.jobId}${meta.createdAt ? ` | created ${meta.createdAt}` : ""}`;
+}
+
 function renderReport(data, meta) {
+  const stamp = jobStampLine(meta);
   const lines = [
     `# Fable ${meta.reviewLabel}`,
     "",
     `Target: ${meta.targetLabel}`,
+    ...(stamp ? [stamp] : []),
     `Verdict: ${data.verdict}`,
     "",
     data.summary,
@@ -714,10 +727,12 @@ function renderReport(data, meta) {
 }
 
 function renderFailure(meta, detail, rawText) {
+  const stamp = jobStampLine(meta);
   const lines = [
     `# Fable ${meta.reviewLabel}`,
     "",
     `Target: ${meta.targetLabel}`,
+    ...(stamp ? [stamp] : []),
     "The reviewer did not return a valid structured result.",
     "",
     `- Detail: ${detail}`,
@@ -782,7 +797,8 @@ function listJobs(dir) {
         return null;
       }
     })
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((job) => reconcileDeadJob(dir, job));
   return jobs.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 }
 
@@ -808,6 +824,38 @@ function isAlive(pid) {
 function effectiveStatus(job) {
   if (job.status === "running" && !isAlive(job.pid)) return "failed (worker died)";
   return job.status;
+}
+
+// A running/queued job whose worker process is gone (machine sleep, reboot,
+// kill -9) would otherwise stay "running" forever: `status` calls it dead but
+// `result` refuses to serve it. Persist the failure so every command agrees.
+function reconcileDeadJob(dir, job) {
+  if (!job) return job;
+  const isActive = (j) => j.status === "running" || j.status === "queued";
+  if (!isActive(job) || !job.pid || job.pid === process.pid || isAlive(job.pid)) return job;
+  // The worker may have written its real outcome (completed/failed/cancelled)
+  // between our read and the liveness check — re-read and only reconcile a job
+  // that is still active on disk, so we never clobber a genuine result.
+  const onDisk = readJob(dir, job.id);
+  if (onDisk && !isActive(onDisk)) return onDisk;
+  job.status = "failed";
+  job.error = "worker process died";
+  job.completedAt = nowIso();
+  job.pid = null;
+  job.progress = { ...job.progress, phase: "worker died" };
+  try {
+    if (job.reportFile && !fs.existsSync(job.reportFile)) {
+      fs.writeFileSync(
+        job.reportFile,
+        `# Fable ${job.kind === "advisory" ? "Advisory" : "Review"}\n\nJob: ${job.id} | created ${job.createdAt}\n\nRun failed: the worker process died before finishing (machine sleep, reboot, or it was killed). Re-run the ${job.kind === "advisory" ? "question" : "review"} to get a report.\n`
+      );
+    }
+    writeJob(dir, job);
+    appendLog(job.logFile, "worker process died — job marked failed");
+  } catch {
+    // reconcile must never break a read path
+  }
+  return job;
 }
 
 // Fans every progress line out to three sinks: the job log file (always), the
@@ -879,7 +927,7 @@ function createReporter({ dir, job, interactive }) {
 // ---------------------------------------------------------------------------
 // the review pipeline
 
-async function executeReview(request, { reporter }) {
+async function executeReview(request, { reporter, job }) {
   const cwd = request.cwd;
   reporter.phase("collecting change context");
   const target = resolveReviewTarget(cwd, { base: request.base, scope: request.scope });
@@ -898,7 +946,14 @@ async function executeReview(request, { reporter }) {
     : request.adversarial
       ? "Adversarial Review"
       : "Review";
-  const meta = { reviewLabel, targetLabel: target.label, sessionIds: [], costUsd: 0 };
+  const meta = {
+    reviewLabel,
+    targetLabel: target.label,
+    jobId: job?.id ?? null,
+    createdAt: job?.createdAt ?? null,
+    sessionIds: [],
+    costUsd: 0,
+  };
 
   const runPass = async (lens, effortOverride) => {
     const prompt = buildReviewPrompt({
@@ -999,11 +1054,7 @@ async function executeReview(request, { reporter }) {
   return { ok: true, rendered: renderReport(data, meta), meta, data };
 }
 
-// Advisory mode: same read-only reviewer harness, but the deliverable is a
-// prose answer to a question instead of a structured findings report.
-async function executeAdvisory(request, { reporter }) {
-  const repoRoot = ensureGitRepository(request.cwd);
-  reporter.phase("collecting repository orientation");
+function buildAdvisoryPrompt(repoRoot, question) {
   const branch = getCurrentBranch(repoRoot);
   const gitStatus = gitChecked(repoRoot, ["status", "--short"]).trim() || "(clean)";
   let recentCommits = "(no commits yet)";
@@ -1013,14 +1064,30 @@ async function executeAdvisory(request, { reporter }) {
     // empty repo; keep the placeholder
   }
   const prompt = interpolate(loadPrompt("advise"), {
-    QUESTION: request.question,
+    QUESTION: question,
     BRANCH: branch,
     // length-truncate only; shorten() would collapse the line structure
     GIT_STATUS: gitStatus.length > 4000 ? `${gitStatus.slice(0, 4000)}\n...(truncated)` : gitStatus,
     RECENT_COMMITS: recentCommits,
   });
+  return { prompt, branch };
+}
 
-  const meta = { reviewLabel: "Advisory", targetLabel: `question on ${branch}`, sessionIds: [], costUsd: 0 };
+// Advisory mode: same read-only reviewer harness, but the deliverable is a
+// prose answer to a question instead of a structured findings report.
+async function executeAdvisory(request, { reporter, job }) {
+  const repoRoot = ensureGitRepository(request.cwd);
+  reporter.phase("collecting repository orientation");
+  const { prompt, branch } = buildAdvisoryPrompt(repoRoot, request.question);
+
+  const meta = {
+    reviewLabel: "Advisory",
+    targetLabel: `question on ${branch}`,
+    jobId: job?.id ?? null,
+    createdAt: job?.createdAt ?? null,
+    sessionIds: [],
+    costUsd: 0,
+  };
   reporter.phase("advisor exploring the repository and forming an answer");
   reporter.line("expect roughly 1-6 minutes depending on the question; progress lines stream continuously");
   const result = await runClaude({
@@ -1051,10 +1118,12 @@ async function executeAdvisory(request, { reporter }) {
   }
 
   reporter.phase("rendering answer");
+  const stamp = jobStampLine(meta);
   const lines = [
     "# Fable Advisory",
     "",
     `Question: ${request.question}`,
+    ...(stamp ? [stamp] : []),
     "",
     answer,
   ];
@@ -1089,7 +1158,7 @@ async function runJob(dir, job, { interactive = false } = {}) {
   const reporter = createReporter({ dir, job, interactive });
   const execute = job.kind === "advisory" ? executeAdvisory : executeReview;
   try {
-    const outcome = await execute(job.request, { reporter });
+    const outcome = await execute(job.request, { reporter, job });
     fs.writeFileSync(job.reportFile, outcome.rendered);
     if (outcome.data) {
       fs.writeFileSync(
@@ -1197,9 +1266,36 @@ function launchBackground(dir, repoRoot, job, options) {
 async function handleReview(argv) {
   const { options, positionals } = parseArgs(argv, {
     valueFlags: ["base", "scope", "model", "effort", "cwd"],
-    boolFlags: ["adversarial", "deep", "background", "json", "quiet"],
+    boolFlags: ["adversarial", "deep", "background", "json", "quiet", "dry-run"],
   });
   const request = buildReviewRequest(options, positionals);
+
+  // Dry run: show what would be sent to the reviewer (target + assembled
+  // prompt) without calling claude or creating a job. Free to run.
+  if (options["dry-run"]) {
+    const target = resolveReviewTarget(request.cwd, { base: request.base, scope: request.scope });
+    const context = collectReviewContext(request.cwd, target);
+    const prompt = buildReviewPrompt({
+      adversarial: request.adversarial,
+      context,
+      focusText: request.focusText,
+      lens: null,
+    });
+    process.stdout.write(
+      [
+        "# Fable Review — dry run (no claude call, no job created)",
+        "",
+        `Target: ${target.label}`,
+        context.summary,
+        `Diff ${context.inline ? "inlined" : "too large — reviewer would self-collect"} | prompt ${Buffer.byteLength(prompt)} bytes | model ${request.model} | effort ${request.effort}${request.deep ? " | deep mode would run 3 lens passes + merge" : ""}`,
+        "",
+        "--- assembled prompt below ---",
+        "",
+        prompt,
+      ].join("\n")
+    );
+    return;
+  }
 
   ensureClaudeAvailable();
   const repoRoot = ensureGitRepository(request.cwd);
@@ -1226,7 +1322,7 @@ async function handleReview(argv) {
 async function handleAsk(argv) {
   const { options, positionals } = parseArgs(argv, {
     valueFlags: ["model", "effort", "cwd"],
-    boolFlags: ["background", "json", "quiet"],
+    boolFlags: ["background", "json", "quiet", "dry-run"],
   });
   const question = positionals.join(" ").trim();
   if (!question) {
@@ -1239,6 +1335,24 @@ async function handleAsk(argv) {
     quiet: Boolean(options.quiet),
     question,
   };
+
+  if (options["dry-run"]) {
+    const dryRoot = ensureGitRepository(request.cwd);
+    const { prompt } = buildAdvisoryPrompt(dryRoot, request.question);
+    process.stdout.write(
+      [
+        "# Fable Advisory — dry run (no claude call, no job created)",
+        "",
+        `Question: ${request.question}`,
+        `Prompt ${Buffer.byteLength(prompt)} bytes | model ${request.model} | effort ${request.effort}`,
+        "",
+        "--- assembled prompt below ---",
+        "",
+        prompt,
+      ].join("\n")
+    );
+    return;
+  }
 
   ensureClaudeAvailable();
   const repoRoot = ensureGitRepository(request.cwd);
@@ -1316,7 +1430,7 @@ function handleStatus(argv) {
   const dir = jobsDir(repoRoot);
 
   if (positionals[0]) {
-    const job = readJob(dir, positionals[0]);
+    const job = reconcileDeadJob(dir, readJob(dir, positionals[0]));
     if (!job) fail(`No job ${positionals[0]} found for this repository.`);
     process.stdout.write(
       options.json ? `${JSON.stringify(job, null, 2)}\n` : `# Fable Job Status\n\n${describeJob(job)}\n`
@@ -1359,10 +1473,30 @@ function handleResult(argv) {
 
   let job;
   if (positionals[0]) {
-    job = readJob(dir, positionals[0]);
+    job = reconcileDeadJob(dir, readJob(dir, positionals[0]));
     if (!job) fail(`No job ${positionals[0]} found for this repository.`);
   } else {
-    job = listJobs(dir).find((j) => j.status === "completed" || j.status === "failed");
+    // Without an explicit id, an active job means "the report you want isn't
+    // ready yet" — serving the previous run's report here would be silently
+    // wrong, which is worse than an error.
+    const jobs = listJobs(dir);
+    const active = jobs.find((j) => j.status === "running" || j.status === "queued");
+    if (active) {
+      const ageMs = Date.now() - Date.parse(active.progress?.startedAt ?? active.createdAt);
+      const finished = jobs.find((j) => j.status === "completed" || j.status === "failed");
+      fail(
+        [
+          `Job ${active.id} is still ${active.status} (started ${formatElapsed(ageMs)} ago) — no result yet.`,
+          `Poll it with: fable-check status ${active.id} — or if it's stuck, clear it with: fable-check cancel ${active.id}`,
+          finished
+            ? `The latest finished report is ${finished.id} from ${finished.completedAt ?? finished.createdAt}; pass its id explicitly if you really want that one: fable-check result ${finished.id}`
+            : null,
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
+    }
+    job = jobs.find((j) => j.status === "completed" || j.status === "failed");
     if (!job) fail("No finished fable-check job found for this repository.");
   }
 
@@ -1393,7 +1527,7 @@ function handleCancel(argv) {
 
   let job;
   if (positionals[0]) {
-    job = readJob(dir, positionals[0]);
+    job = reconcileDeadJob(dir, readJob(dir, positionals[0]));
   } else {
     job = listJobs(dir).find((j) => j.status === "running" || j.status === "queued");
   }
@@ -1502,8 +1636,8 @@ function printUsage() {
       "  fable-check.mjs setup [--json]",
       "  fable-check.mjs review [--adversarial] [--deep] [--base <ref>] [--scope auto|working-tree|branch]",
       "                         [--effort low|medium|high|xhigh|max] [--model <model>]",
-      "                         [--background] [--json] [--quiet] [focus text]",
-      "  fable-check.mjs ask    [--effort ...] [--model ...] [--background] [--json] [--quiet] <question>",
+      "                         [--background] [--json] [--quiet] [--dry-run] [focus text]",
+      "  fable-check.mjs ask    [--effort ...] [--model ...] [--background] [--json] [--quiet] [--dry-run] <question>",
       "  fable-check.mjs status [job-id] [--json]",
       "  fable-check.mjs result [job-id] [--json]",
       "  fable-check.mjs cancel [job-id] [--json]",
@@ -1512,6 +1646,7 @@ function printUsage() {
       "--deep runs three parallel lens passes (correctness, security, design) plus a merge pass.",
       "`ask` answers an advisory question (architecture, tradeoffs, second opinions) with read-only repo access.",
       "Progress streams to stderr while running (tool calls + heartbeats every ~20s); --quiet suppresses it.",
+      "--dry-run prints the resolved target and assembled prompt without calling claude (free).",
       "Background jobs expose live progress via `status` (phase, elapsed, last activity).",
       "",
     ].join("\n")
@@ -1553,6 +1688,39 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  fail(error instanceof Error ? error.message : String(error));
-});
+// Run the CLI only when executed directly; importing this file (tests) must
+// not trigger main(). realpath both sides so the skill-dir symlink still counts.
+function isDirectInvocation() {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectInvocation()) {
+  main().catch((error) => {
+    fail(error instanceof Error ? error.message : String(error));
+  });
+}
+
+export {
+  splitRawArgumentString,
+  normalizeArgv,
+  parseArgs,
+  shorten,
+  formatElapsed,
+  resolveReviewTarget,
+  collectReviewContext,
+  extractStructured,
+  normalizeReviewData,
+  jobStampLine,
+  renderReport,
+  jobsDir,
+  writeJob,
+  readJob,
+  listJobs,
+  reconcileDeadJob,
+  effectiveStatus,
+};

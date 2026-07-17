@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-17 — Trust fixes + free offline tests
+
+**TL;DR: `result` can no longer hand you a stale report, dead background jobs recover cleanly, and the fragile parsing layer now has a free test suite.**
+
+- **`result` refuses stale reports.** With no job id, `result` now errors while a job is still running instead of silently serving the *previous* run's report — the one way the tool could confidently return wrong information. Pass an id explicitly to fetch an old report. Every report is also stamped with its job id and creation time.
+- **Dead background workers reconcile to `failed`.** A worker killed by sleep/reboot/`kill -9` used to leave its job "running" forever (`status` said dead, `result` said still running). Any read now persists it as failed with a clear report explaining what happened.
+- **Offline test suite.** `node --test test/*.test.mjs` — 21 tests covering structured-output extraction, review normalization (synonym fields, off-enum severities), argv handling, review-target selection against a temp git repo, dead-worker reconciliation, and the CLI guards. No network, no claude calls, no cost.
+- **`--dry-run` for `review` and `ask`.** Prints the resolved target and the fully assembled prompt without calling claude or creating a job — free verification of prompt/target changes.
+
 ## 2026-06-11 — Advisory mode + live progress
 
 **TL;DR: fable-check can now answer questions, not just review code — and it's impossible to mistake a running job for a dead one.**
