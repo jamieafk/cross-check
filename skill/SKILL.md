@@ -15,11 +15,21 @@ All commands run from the repository being reviewed. `<skill-dir>` is this skill
 - Return the script's output to the user **verbatim** — do not paraphrase, summarize, or filter the findings or the answer.
 - After presenting the output, you may offer to act on it as a separate follow-up.
 
-## Before running: pick the effort
+## Before running: always show the menu
 
-Ask the user which effort to use unless they already said: **low** (fast, cheapest; fine for small diffs), **medium** (default; solid everyday review), **high** (thorough; pre-ship or anything subtle). Offer exactly those three. `xhigh` exists for when the user asks for the most extensive review possible; `max` is Claude-only. Pass the choice as `--effort <level>`.
+The user will not remember the options, so **every invocation starts with this menu** (fill in the detected default reviewer from Routing, and pre-select anything the user already said). Ask it as one message, let them answer in a few words ("2, both, high"), then run.
 
-Also mention which model will review (see Routing) so the user can override with `--via`.
+```
+cross-check — pick one per line (defaults in [brackets]):
+1. What:      [review]  review · adversarial <focus> · deep · ask "<question>"
+2. Reviewer:  [Astra]   auto (the other vendor) · fable · astra · both (two reviewers + arbiter, lists disagreements)
+3. Effort:    [medium]  low (fast, cheap) · medium · high (pre-ship) · xhigh (most extensive)
+4. Run:       [foreground]  background (for deep, both, or big diffs)
+```
+
+Map the answers to flags: 1 → `review` / `review --adversarial <focus>` / `review --deep` / `ask "<question>"`; 2 → nothing / `--via claude` / `--via codex` / `--via both`; 3 → `--effort <level>`; 4 → `--background`. Then echo the exact command you are about to run so the user learns it. If the user gives a complete instruction up front ("adversarial review with both, high, background"), skip the menu and just echo the command.
+
+`max` effort is Claude-only and not on the menu; use it only if the user asks for it by name.
 
 ## Routing
 
