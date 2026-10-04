@@ -5,11 +5,9 @@ Cross-agent skill (Claude Code + Codex): code review and advisory Q&A by the *ot
 ## Architecture
 
 - `skill/` is the portable unit; `install.sh` symlinks it to `~/.claude/skills/cross-check` and `~/.codex/skills/cross-check`. Same SKILL.md for both agents.
-- `skill/scripts/cross-check.mjs`: single zero-dep Node ESM script. Subcommands: `setup`, `review`, `ask`, `worker` (internal), `status`, `result`, `cancel`.
 - **Backends** (`BACKENDS` map): `claude` → `claude -p --output-format stream-json --json-schema ...`; `codex` → `codex exec --sandbox read-only --json --output-schema <file> -c model_reasoning_effort=...`. Both take the prompt on **stdin** and resolve to the same envelope shape (`result`, `session_id`, …) via the shared `runCli` plumbing. Auth = the user's existing logins, never API keys.
 - **Routing** (`resolveVia`): `--via` wins; else `CLAUDECODE` env → codex, `CODEX_SESSION_ID`/`CODEX_THREAD_ID` → claude, neither → codex. `both` = every pass on both backends concurrently, then a merge on `mergerFor()` = the caller's opposite, with `prompts/merge-both.md` / `advise-merge.md` and a `disagreements[]` field rendered first.
-- Live progress: claude `assistant.tool_use` events and codex `item.started command_execution` events → progress lines → stderr, job log, throttled `progress` in job JSON (stall warning after 5 min idle). Heartbeat ~20s; `CROSS_CHECK_HEARTBEAT_MS` overrides.
-- Job state/reports: `~/.cross-check/jobs/<repo-basename>-<sha1-8>/`, never inside reviewed repos. `CROSS_CHECK_STATE_DIR` redirects (tests).
+- Job state/reports: `~/.cross-check/jobs/<repo-basename>-<sha1-8>/`, never inside reviewed repos. `CROSS_CHECK_STATE_DIR` redirects (tests); `CROSS_CHECK_HEARTBEAT_MS` tunes the ~20s heartbeat.
 - `--deep`: 3 `LENSES` per backend concurrently, then merge at `high` effort.
 
 ## Decisions
@@ -19,7 +17,6 @@ Cross-agent skill (Claude Code + Codex): code review and advisory Q&A by the *ot
 - **Schema flags are belt-and-braces on both CLIs**: schema text is appended to every prompt AND passed as a flag, and `extractStructured`/`normalizeReviewData` tolerate fenced JSON, synonym fields, off-enum severities. Keep both.
 - **OpenAI strict schema rules**: every property must be listed in `required` and every object needs `additionalProperties:false`, or codex fails the turn with `invalid_json_schema`. That is why `disagreements` is required (empty array in single-reviewer runs).
 - **Claude's `--json-schema` rejects the `$schema` key**; `runClaude` strips it before passing the flag.
-- Inline-diff threshold 400KB; above it the reviewer self-collects via read-only git.
 - `rescue` (task delegation) and Stop-hook gates deliberately excluded.
 - Attribution: prompts/schema/target-selection adapted from codex-plugin-cc (Apache-2.0). Keep `NOTICE`.
 
