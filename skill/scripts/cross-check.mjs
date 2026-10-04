@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// fable-check — extensive code review powered by Claude Fable 5.
+// cross-check — extensive code review powered by Claude Fable 5.
 // Runs the local `claude` CLI headlessly with read-only tools; auth rides on the
 // user's existing Claude Code login. Portions of the prompt/schema design are
 // adapted from openai/codex-plugin-cc (Apache-2.0) — see NOTICE.
@@ -14,9 +14,9 @@ import { fileURLToPath } from "node:url";
 
 const SKILL_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const SCHEMA_PATH = path.join(SKILL_ROOT, "schemas", "review-output.schema.json");
-// FABLE_CHECK_STATE_DIR exists so tests can run against a throwaway state dir.
+// CROSS_CHECK_STATE_DIR exists so tests can run against a throwaway state dir.
 const STATE_ROOT =
-  process.env.FABLE_CHECK_STATE_DIR || path.join(os.homedir(), ".fable-check", "jobs");
+  process.env.CROSS_CHECK_STATE_DIR || process.env.FABLE_CHECK_STATE_DIR || path.join(os.homedir(), ".cross-check", "jobs");
 
 const DEFAULT_MODEL = "claude-fable-5";
 const DEFAULT_EFFORT = "xhigh";
@@ -26,8 +26,8 @@ const MAX_INLINE_DIFF_BYTES = 400 * 1024;
 const MAX_UNTRACKED_FILE_BYTES = 48 * 1024;
 const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
 const HEARTBEAT_MS =
-  Number(process.env.FABLE_CHECK_HEARTBEAT_MS) > 0
-    ? Number(process.env.FABLE_CHECK_HEARTBEAT_MS)
+  Number(process.env.CROSS_CHECK_HEARTBEAT_MS) > 0
+    ? Number(process.env.CROSS_CHECK_HEARTBEAT_MS)
     : 20 * 1000;
 const JOB_WRITE_THROTTLE_MS = 1500;
 const STALL_WARN_MS = 5 * 60 * 1000;
@@ -142,7 +142,7 @@ function parseArgs(argv, { valueFlags = [], boolFlags = [] } = {}) {
           if (options[name] === undefined) fail(`Missing value for --${name}.`);
         }
       } else {
-        fail(`Unknown flag --${name}. Run \`fable-check.mjs help\` for usage.`);
+        fail(`Unknown flag --${name}. Run \`cross-check.mjs help\` for usage.`);
       }
     } else {
       positionals.push(arg);
@@ -178,7 +178,7 @@ function ensureGitRepository(cwd) {
     throw new Error("git is not installed. Install Git and retry.");
   }
   if (result.status !== 0) {
-    throw new Error("fable-check must run inside a Git repository.");
+    throw new Error("cross-check must run inside a Git repository.");
   }
   return result.stdout.trim();
 }
@@ -878,7 +878,7 @@ function createReporter({ dir, job, interactive }) {
     if (onDisk?.status === "cancelled") {
       appendLog(job.logFile, "cancellation detected — stopping claude and exiting");
       if (interactive && !job.request?.quiet) {
-        process.stderr.write("[fable-check] cancellation detected — stopping\n");
+        process.stderr.write("[cross-check] cancellation detected — stopping\n");
       }
       killActiveClaudeChildren();
       process.exit(1);
@@ -894,7 +894,7 @@ function createReporter({ dir, job, interactive }) {
       if (kind === "tool") toolCalls += 1;
       appendLog(job.logFile, text);
       if (interactive && !job.request?.quiet) {
-        process.stderr.write(`[fable-check] ${text}\n`);
+        process.stderr.write(`[cross-check] ${text}\n`);
       }
       // lastActivityAt is "when did the wrapper last say something" (display);
       // lastEventAt is "when did the model last show proof of life" (stall
@@ -1255,9 +1255,9 @@ function launchBackground(dir, repoRoot, job, options) {
       ? `${JSON.stringify(payload, null, 2)}\n`
       : [
           `${job.title} started in the background as ${job.id} (${job.targetLabel}).`,
-          `Poll progress (live phase, tool activity, elapsed time): fable-check status ${job.id}  — every 30-60s is a good cadence.`,
+          `Poll progress (live phase, tool activity, elapsed time): cross-check status ${job.id}  — every 30-60s is a good cadence.`,
           `Stream the activity log: tail -f ${job.logFile}`,
-          `Get the report when done: fable-check result ${job.id}`,
+          `Get the report when done: cross-check result ${job.id}`,
           `It is still healthy as long as status shows recent activity; only treat it as stalled if status itself says so.`,
         ].join("\n") + "\n"
   );
@@ -1326,7 +1326,7 @@ async function handleAsk(argv) {
   });
   const question = positionals.join(" ").trim();
   if (!question) {
-    fail('ask requires a question, e.g. `fable-check.mjs ask "should the job runner use worker threads?"`');
+    fail('ask requires a question, e.g. `cross-check.mjs ask "should the job runner use worker threads?"`');
   }
   const request = {
     cwd: options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd(),
@@ -1405,16 +1405,16 @@ function describeJob(job) {
         Date.now() - Date.parse(job.progress.lastEventAt ?? job.progress.lastActivityAt ?? job.createdAt);
       lines.push(
         eventAgeMs > STALL_WARN_MS
-          ? `  WARNING: no model events for ${formatElapsed(eventAgeMs)} — possibly stalled. Consider \`fable-check cancel ${job.id}\` and rerunning.`
+          ? `  WARNING: no model events for ${formatElapsed(eventAgeMs)} — possibly stalled. Consider \`cross-check cancel ${job.id}\` and rerunning.`
           : `  Healthy: activity is recent. Long runs are normal — poll again in 30-60s.`
       );
     }
   }
   if (job.status === "completed" || job.status === "failed") {
-    lines.push(`  Report: fable-check result ${job.id}`);
+    lines.push(`  Report: cross-check result ${job.id}`);
   }
   if (job.status === "running" || job.status === "queued") {
-    lines.push(`  Cancel: fable-check cancel ${job.id}`);
+    lines.push(`  Cancel: cross-check cancel ${job.id}`);
     lines.push(`  Log: ${job.logFile}`);
   }
   return lines.join("\n");
@@ -1444,7 +1444,7 @@ function handleStatus(argv) {
     return;
   }
   if (jobs.length === 0) {
-    process.stdout.write("No fable-check jobs recorded for this repository yet.\n");
+    process.stdout.write("No cross-check jobs recorded for this repository yet.\n");
     return;
   }
   const active = jobs.filter((j) => j.status === "running" || j.status === "queued");
@@ -1487,9 +1487,9 @@ function handleResult(argv) {
       fail(
         [
           `Job ${active.id} is still ${active.status} (started ${formatElapsed(ageMs)} ago) — no result yet.`,
-          `Poll it with: fable-check status ${active.id} — or if it's stuck, clear it with: fable-check cancel ${active.id}`,
+          `Poll it with: cross-check status ${active.id} — or if it's stuck, clear it with: cross-check cancel ${active.id}`,
           finished
-            ? `The latest finished report is ${finished.id} from ${finished.completedAt ?? finished.createdAt}; pass its id explicitly if you really want that one: fable-check result ${finished.id}`
+            ? `The latest finished report is ${finished.id} from ${finished.completedAt ?? finished.createdAt}; pass its id explicitly if you really want that one: cross-check result ${finished.id}`
             : null,
         ]
           .filter(Boolean)
@@ -1497,11 +1497,11 @@ function handleResult(argv) {
       );
     }
     job = jobs.find((j) => j.status === "completed" || j.status === "failed");
-    if (!job) fail("No finished fable-check job found for this repository.");
+    if (!job) fail("No finished cross-check job found for this repository.");
   }
 
   if (job.status === "running" || job.status === "queued") {
-    fail(`Job ${job.id} is still ${job.status}. Check \`fable-check status ${job.id}\`.`);
+    fail(`Job ${job.id} is still ${job.status}. Check \`cross-check status ${job.id}\`.`);
   }
   if (options.json) {
     process.stdout.write(`${JSON.stringify(job, null, 2)}\n`);
@@ -1531,7 +1531,7 @@ function handleCancel(argv) {
   } else {
     job = listJobs(dir).find((j) => j.status === "running" || j.status === "queued");
   }
-  if (!job) fail("No active fable-check job to cancel.");
+  if (!job) fail("No active cross-check job to cancel.");
   if (job.status !== "running" && job.status !== "queued") {
     fail(`Job ${job.id} is already ${job.status}.`);
   }
@@ -1550,7 +1550,7 @@ function handleCancel(argv) {
     process.stdout.write(
       options.json
         ? `${JSON.stringify(current, null, 2)}\n`
-        : `Job ${current.id} already finished as ${current.status} — nothing to cancel. Report: fable-check result ${current.id}\n`
+        : `Job ${current.id} already finished as ${current.status} — nothing to cancel. Report: cross-check result ${current.id}\n`
     );
     return;
   }
@@ -1568,7 +1568,7 @@ function ensureClaudeAvailable() {
   const result = spawnSync("claude", ["--version"], { encoding: "utf8" });
   if (result.error || result.status !== 0) {
     throw new Error(
-      "The `claude` CLI is not installed or not on PATH. Install Claude Code (https://claude.com/claude-code), then run `fable-check setup`."
+      "The `claude` CLI is not installed or not on PATH. Install Claude Code (https://claude.com/claude-code), then run `cross-check setup`."
     );
   }
   return result.stdout.trim();
@@ -1630,17 +1630,17 @@ function handleSetup(argv) {
 function printUsage() {
   process.stdout.write(
     [
-      "fable-check — extensive code review and advisory powered by Claude Fable 5",
+      "cross-check — extensive code review and advisory powered by Claude Fable 5",
       "",
       "Usage:",
-      "  fable-check.mjs setup [--json]",
-      "  fable-check.mjs review [--adversarial] [--deep] [--base <ref>] [--scope auto|working-tree|branch]",
+      "  cross-check.mjs setup [--json]",
+      "  cross-check.mjs review [--adversarial] [--deep] [--base <ref>] [--scope auto|working-tree|branch]",
       "                         [--effort low|medium|high|xhigh|max] [--model <model>]",
       "                         [--background] [--json] [--quiet] [--dry-run] [focus text]",
-      "  fable-check.mjs ask    [--effort ...] [--model ...] [--background] [--json] [--quiet] [--dry-run] <question>",
-      "  fable-check.mjs status [job-id] [--json]",
-      "  fable-check.mjs result [job-id] [--json]",
-      "  fable-check.mjs cancel [job-id] [--json]",
+      "  cross-check.mjs ask    [--effort ...] [--model ...] [--background] [--json] [--quiet] [--dry-run] <question>",
+      "  cross-check.mjs status [job-id] [--json]",
+      "  cross-check.mjs result [job-id] [--json]",
+      "  cross-check.mjs cancel [job-id] [--json]",
       "",
       "Reviews are read-only. Focus text steers the review (most useful with --adversarial).",
       "--deep runs three parallel lens passes (correctness, security, design) plus a merge pass.",
@@ -1684,7 +1684,7 @@ async function main() {
       printUsage();
       break;
     default:
-      fail(`Unknown subcommand: ${subcommand}. Run \`fable-check.mjs help\` for usage.`);
+      fail(`Unknown subcommand: ${subcommand}. Run \`cross-check.mjs help\` for usage.`);
   }
 }
 

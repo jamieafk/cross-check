@@ -1,4 +1,4 @@
-// Offline regression tests for fable-check's fragile layers: structured-output
+// Offline regression tests for cross-check's fragile layers: structured-output
 // parsing, review normalization, arg handling, target selection, and job-state
 // reconciliation. No network, no claude CLI, no cost — run with `node --test test/`.
 import { test } from "node:test";
@@ -11,15 +11,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Point job state at a throwaway dir BEFORE importing the module under test.
-const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "fable-check-test-state-"));
-process.env.FABLE_CHECK_STATE_DIR = STATE_DIR;
+const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-state-"));
+process.env.CROSS_CHECK_STATE_DIR = STATE_DIR;
 
 const SCRIPT = path.resolve(
   fileURLToPath(new URL(".", import.meta.url)),
   "..",
   "skill",
   "scripts",
-  "fable-check.mjs"
+  "cross-check.mjs"
 );
 const {
   splitRawArgumentString,
@@ -39,7 +39,7 @@ const {
 } = await import(SCRIPT);
 
 function makeTempRepo() {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "fable-check-test-repo-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-repo-"));
   const run = (...args) => {
     const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
     assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
@@ -230,7 +230,7 @@ test("renderReport stamps the job id and creation time", () => {
 });
 
 // ---------------------------------------------------------------------------
-// dead-worker reconciliation (temp state dir via FABLE_CHECK_STATE_DIR)
+// dead-worker reconciliation (temp state dir via CROSS_CHECK_STATE_DIR)
 
 function seedJob(dir, overrides) {
   const id = overrides.id;
@@ -253,7 +253,7 @@ function seedJob(dir, overrides) {
 }
 
 test("reconcileDeadJob marks a dead-worker job failed and writes a report", () => {
-  const dir = jobsDir(fs.mkdtempSync(path.join(os.tmpdir(), "fable-check-test-r1-")));
+  const dir = jobsDir(fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-r1-")));
   seedJob(dir, { id: "rev-dead0001", status: "running", pid: deadPid() });
   const reconciled = reconcileDeadJob(dir, readJob(dir, "rev-dead0001"));
   assert.equal(reconciled.status, "failed");
@@ -264,7 +264,7 @@ test("reconcileDeadJob marks a dead-worker job failed and writes a report", () =
 });
 
 test("reconcileDeadJob leaves live, own-process, and finished jobs alone", () => {
-  const dir = jobsDir(fs.mkdtempSync(path.join(os.tmpdir(), "fable-check-test-r2-")));
+  const dir = jobsDir(fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-r2-")));
   seedJob(dir, { id: "rev-own00001", status: "running", pid: process.pid });
   seedJob(dir, { id: "rev-done0001", status: "completed", pid: null });
   assert.equal(reconcileDeadJob(dir, readJob(dir, "rev-own00001")).status, "running");
@@ -272,7 +272,7 @@ test("reconcileDeadJob leaves live, own-process, and finished jobs alone", () =>
 });
 
 test("reconcileDeadJob never clobbers an outcome written after our stale read", () => {
-  const dir = jobsDir(fs.mkdtempSync(path.join(os.tmpdir(), "fable-check-test-r4-")));
+  const dir = jobsDir(fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-r4-")));
   // On disk the worker already finished; our in-memory copy is a stale
   // "running" read with a now-dead pid.
   seedJob(dir, { id: "rev-race0001", status: "completed", pid: null, verdict: "approve" });
@@ -283,7 +283,7 @@ test("reconcileDeadJob never clobbers an outcome written after our stale read", 
 });
 
 test("listJobs reconciles dead workers as a side effect", () => {
-  const dir = jobsDir(fs.mkdtempSync(path.join(os.tmpdir(), "fable-check-test-r3-")));
+  const dir = jobsDir(fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-r3-")));
   seedJob(dir, { id: "rev-dead0002", status: "running", pid: deadPid() });
   const jobs = listJobs(dir);
   assert.equal(jobs.length, 1);
@@ -303,8 +303,8 @@ function runCli(args, { cwd, env = {} } = {}) {
 
 test("result without an id refuses while a job is running", async () => {
   const { repo } = makeTempRepo();
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "fable-check-test-cli-"));
-  const env = { FABLE_CHECK_STATE_DIR: stateDir };
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-cli-"));
+  const env = { CROSS_CHECK_STATE_DIR: stateDir };
   // The CLI keys job dirs on <basename>-<sha1(repoRoot) first 8>; repoRoot
   // comes from `git rev-parse --show-toplevel`, which resolves symlinks.
   const realRepo = fs.realpathSync(repo);
@@ -362,7 +362,7 @@ test("review --dry-run prints the assembled prompt without calling claude", () =
   fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
   const result = runCli(["review", "--dry-run"], {
     cwd: repo,
-    env: { FABLE_CHECK_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "fable-check-test-dr-")) },
+    env: { CROSS_CHECK_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-dr-")) },
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /dry run \(no claude call, no job created\)/);
@@ -375,7 +375,7 @@ test("ask --dry-run prints the assembled advisory prompt", () => {
   const { repo } = makeTempRepo();
   const result = runCli(["ask", "--dry-run", "is the design sound?"], {
     cwd: repo,
-    env: { FABLE_CHECK_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "fable-check-test-da-")) },
+    env: { CROSS_CHECK_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-da-")) },
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /is the design sound\?/);
