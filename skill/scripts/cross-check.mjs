@@ -1,8 +1,10 @@
 #!/usr/bin/env node
-// cross-check — extensive code review powered by Claude Fable 5.
-// Runs the local `claude` CLI headlessly with read-only tools; auth rides on the
-// user's existing Claude Code login. Portions of the prompt/schema design are
-// adapted from openai/codex-plugin-cc (Apache-2.0) — see NOTICE.
+// cross-check — extensive code review by the *other* vendor's model.
+// Claude Code callers get a Codex (gpt-6-astra) review; Codex callers get a
+// Claude (Fable) review; `--via both` runs both and merges. Each backend runs
+// its local CLI headlessly with read-only tools; auth rides on the user's
+// existing logins. Portions of the prompt/schema design are adapted from
+// openai/codex-plugin-cc (Apache-2.0) — see NOTICE.
 
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
@@ -18,13 +20,12 @@ const SCHEMA_PATH = path.join(SKILL_ROOT, "schemas", "review-output.schema.json"
 const STATE_ROOT =
   process.env.CROSS_CHECK_STATE_DIR || process.env.FABLE_CHECK_STATE_DIR || path.join(os.homedir(), ".cross-check", "jobs");
 
-const DEFAULT_MODEL = "claude-fable-5";
-const DEFAULT_EFFORT = "xhigh";
+const DEFAULT_EFFORT = "medium";
 const MERGE_EFFORT = "high";
-const VALID_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+const EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"];
 const MAX_INLINE_DIFF_BYTES = 400 * 1024;
 const MAX_UNTRACKED_FILE_BYTES = 48 * 1024;
-const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
+const MODEL_TIMEOUT_MS = 45 * 60 * 1000;
 const HEARTBEAT_MS =
   Number(process.env.CROSS_CHECK_HEARTBEAT_MS) > 0
     ? Number(process.env.CROSS_CHECK_HEARTBEAT_MS)
@@ -58,6 +59,71 @@ const DISALLOWED_TOOLS = [
   "WebFetch",
   "KillShell",
 ].join(",");
+
+// ---------------------------------------------------------------------------
+// backends. Each runs one prompt headlessly with read-only tools and resolves
+// to the same shape: { status, stdout, stderr, durationMs, timedOut, toolCalls,
+// envelope: { result, structured_output?, session_id?, total_cost_usd? } }.
+
+const BACKENDS = {
+  claude: {
+    key: "claude",
+    label: "Fable",
+    vendor: "Claude",
+    defaultModel: "claude-fable-5",
+    efforts: new Set(["low", "medium", "high", "xhigh", "max"]),
+    run: (opts) => runClaude(opts),
+    ensure: () => ensureClaudeAvailable(),
+    resumeHint: (id) => `claude -r ${id}`,
+  },
+  codex: {
+    key: "codex",
+    label: "Astra",
+    vendor: "Codex",
+    defaultModel: "gpt-6-astra",
+    efforts: new Set(["low", "medium", "high", "xhigh"]),
+    run: (opts) => runCodex(opts),
+    ensure: () => ensureCodexAvailable(),
+    resumeHint: (id) => `codex exec resume ${id}`,
+  },
+};
+const OPPOSITE = { claude: "codex", codex: "claude" };
+
+// Which backend reviews. Explicit --via wins. Otherwise the caller's opposite:
+// inside Claude Code (CLAUDECODE set) → codex; inside Codex (CODEX_SESSION_ID
+// or CODEX_THREAD_ID set) → claude; a plain terminal → codex.
+function detectCaller(env = process.env) {
+  if (env.CLAUDECODE) return "claude";
+  if (env.CODEX_SESSION_ID || env.CODEX_THREAD_ID) return "codex";
+  return null;
+}
+function resolveVia(flag, env = process.env) {
+  if (flag) {
+    const via = String(flag).toLowerCase();
+    if (via === "fable" || via === "anthropic") return "claude";
+    if (via === "astra" || via === "openai") return "codex";
+    if (via === "claude" || via === "codex" || via === "both") return via;
+    fail(`Unsupported --via "${flag}". Use claude, codex, or both.`);
+  }
+  const caller = detectCaller(env);
+  return caller ? OPPOSITE[caller] : "codex";
+}
+// Backends a `via` value expands to, in a stable order.
+function backendsFor(via) {
+  return via === "both" ? ["claude", "codex"] : [via];
+}
+// In both-mode the merge pass runs on the caller's opposite (the model the
+// single-backend path would have used), so a Claude caller never has Claude
+// grade its own review.
+function mergerFor(via, env = process.env) {
+  if (via !== "both") return via;
+  return resolveVia(null, env);
+}
+function reviewerLabel(via, models = {}) {
+  return backendsFor(via)
+    .map((b) => (models[b] && models[b] !== BACKENDS[b].defaultModel ? `${BACKENDS[b].label} (${models[b]})` : BACKENDS[b].label))
+    .join(" + ");
+}
 
 const LENSES = [
   {
@@ -378,9 +444,14 @@ function buildLensBlock(lens) {
   ].join("\n");
 }
 
-function buildReviewPrompt({ adversarial, context, focusText, lens }) {
+function reviewerName(backend) {
+  return `${BACKENDS[backend].vendor} ${BACKENDS[backend].label}`;
+}
+
+function buildReviewPrompt({ adversarial, context, focusText, lens, backend }) {
   const template = loadPrompt(adversarial ? "adversarial-review" : "review");
   return interpolate(template, {
+    REVIEWER: reviewerName(backend ?? "claude"),
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
@@ -408,10 +479,10 @@ function summarizeToolUse(name, input, cwd) {
 
 // Spawned claude processes, tracked so cancellation (signal or cancelled job
 // state) can terminate them instead of orphaning them to burn usage.
-const ACTIVE_CLAUDE_CHILDREN = new Set();
+const ACTIVE_CHILDREN = new Set();
 
-function killActiveClaudeChildren() {
-  for (const child of ACTIVE_CLAUDE_CHILDREN) {
+function killActiveChildren() {
+  for (const child of ACTIVE_CHILDREN) {
     try {
       child.kill("SIGTERM");
     } catch {
@@ -425,7 +496,7 @@ function killActiveClaudeChildren() {
 if (isDirectInvocation()) {
   for (const signal of ["SIGTERM", "SIGINT"]) {
     process.on(signal, () => {
-      killActiveClaudeChildren();
+      killActiveChildren();
       process.exit(signal === "SIGINT" ? 130 : 143);
     });
   }
@@ -434,6 +505,196 @@ if (isDirectInvocation()) {
 // Runs the claude CLI with stream-json output so progress is observable while
 // the model works. The final "result" event carries the same envelope fields
 // as --output-format json (result, structured_output, session_id, cost).
+function runModel({ backend, ...opts }) {
+  const impl = BACKENDS[backend];
+  if (!impl) throw new Error(`Unknown backend "${backend}"`);
+  return impl.run(opts);
+}
+
+// Shared plumbing for both CLIs: spawn, feed the prompt on stdin, parse JSONL
+// events, heartbeat during silent thinking, enforce the timeout.
+function runCli({ command, args, cwd, prompt, label, onProgress, handleEvent, finalize }) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const child = spawn(command, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+    ACTIVE_CHILDREN.add(child);
+    let stderr = "";
+    let lineBuffer = "";
+    let rawStdout = "";
+    let timedOut = false;
+    const state = { toolCalls: 0, lastNote: "starting up", lastEventAtMs: Date.now() };
+    let lastEmitAt = Date.now();
+
+    const emit = (text, kind = "info", eventAgeMs = 0) => {
+      lastEmitAt = Date.now();
+      onProgress?.(text, { kind, toolCalls: state.toolCalls, eventAgeMs });
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, MODEL_TIMEOUT_MS);
+
+    // Long thinking stretches produce no events; the heartbeat keeps callers
+    // (and watching agents) from mistaking that for a stall.
+    const heartbeat = setInterval(() => {
+      if (Date.now() - lastEmitAt < Math.max(0, HEARTBEAT_MS - 2000)) return;
+      const eventAgeMs = Date.now() - state.lastEventAtMs;
+      const idleNote = eventAgeMs > 60_000 ? ` (no model events for ${formatElapsed(eventAgeMs)})` : "";
+      emit(
+        `still working — ${formatElapsed(Date.now() - started)} elapsed, ${state.toolCalls} tool call(s) so far, last: ${state.lastNote}${idleNote}`,
+        "heartbeat",
+        eventAgeMs
+      );
+    }, HEARTBEAT_MS);
+
+    const consume = (text) => {
+      lineBuffer += text;
+      let newline;
+      while ((newline = lineBuffer.indexOf("\n")) !== -1) {
+        const line = lineBuffer.slice(0, newline).trim();
+        lineBuffer = lineBuffer.slice(newline + 1);
+        if (!line) continue;
+        try {
+          state.lastEventAtMs = Date.now();
+          handleEvent(JSON.parse(line), { emit, state });
+        } catch {
+          // non-JSON noise on stdout; ignore
+        }
+      }
+    };
+
+    const finish = (status, extraStderr = "") => {
+      ACTIVE_CHILDREN.delete(child);
+      clearTimeout(timer);
+      clearInterval(heartbeat);
+      if (lineBuffer.trim()) consume("\n");
+      resolve({
+        status,
+        stdout: rawStdout,
+        stderr: extraStderr ? `${stderr}\n${extraStderr}` : stderr,
+        durationMs: Date.now() - started,
+        timedOut,
+        toolCalls: state.toolCalls,
+        envelope: finalize(),
+      });
+    };
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      rawStdout += chunk;
+      consume(chunk);
+    });
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.on("error", (error) => finish(1, error.message));
+    child.on("close", (code) => finish(code ?? 1));
+
+    child.stdin.write(prompt);
+    child.stdin.end();
+    emit(`${label} started (pid=${child.pid})`);
+  });
+}
+
+function withSchemaPrompt(prompt) {
+  const schema = fs.readFileSync(SCHEMA_PATH, "utf8");
+  // Agentic runs don't reliably enforce a schema flag on either CLI, so the
+  // schema also goes into the prompt verbatim — exact field names, exact enums.
+  return `${prompt}\n\n<output_schema>\nYour final message must be exactly one JSON object conforming to this JSON Schema — no markdown fences, no prose before or after, no extra or renamed fields:\n${schema}\n</output_schema>\n`;
+}
+
+// Reduces codex `--json` JSONL events into progress + a claude-shaped envelope.
+// Exported for tests (pure: no process state).
+function codexEventReducer(cwd) {
+  const acc = { threadId: null, lastMessage: "", usage: null, error: null };
+  return {
+    handle(event, { emit, state }) {
+      const item = event.item ?? {};
+      if (event.type === "thread.started") {
+        acc.threadId = event.thread_id ?? null;
+        emit(`session started (thread=${acc.threadId ?? "?"})`);
+        return;
+      }
+      if (event.type === "item.started" && item.type === "command_execution") {
+        state.toolCalls += 1;
+        state.lastNote = `running: ${shorten(String(item.command ?? ""), 96)}`;
+        emit(`tool #${state.toolCalls}: ${state.lastNote}`, "tool");
+        return;
+      }
+      if (event.type === "item.started" && (item.type === "file_read" || item.type === "web_search")) {
+        state.toolCalls += 1;
+        state.lastNote = `${item.type}: ${shorten(String(item.path ?? item.query ?? ""), 96)}`;
+        emit(`tool #${state.toolCalls}: ${state.lastNote}`, "tool");
+        return;
+      }
+      if (event.type === "item.completed" && item.type === "reasoning") {
+        state.lastNote = "thinking";
+        return;
+      }
+      if (event.type === "item.completed" && item.type === "agent_message") {
+        acc.lastMessage = typeof item.text === "string" ? item.text : acc.lastMessage;
+        return;
+      }
+      if (event.type === "turn.completed") {
+        acc.usage = event.usage ?? null;
+        return;
+      }
+      if (event.type === "turn.failed" || event.type === "error") {
+        acc.error = event.error?.message ?? event.message ?? "codex reported an error";
+      }
+    },
+    finalize() {
+      return {
+        result: acc.lastMessage,
+        session_id: acc.threadId,
+        usage: acc.usage,
+        error: acc.error,
+      };
+    },
+  };
+}
+
+function codexEffort(effort) {
+  return effort === "max" ? "xhigh" : effort;
+}
+
+function runCodex({ prompt, cwd, model, effort, withSchema = true, onProgress }) {
+  const args = [
+    "exec",
+    "--sandbox",
+    "read-only",
+    "--json",
+    "--skip-git-repo-check",
+    "--model",
+    model,
+    "-c",
+    `model_reasoning_effort="${codexEffort(effort)}"`,
+  ];
+  let fullPrompt = prompt;
+  if (withSchema) {
+    fullPrompt = withSchemaPrompt(prompt);
+    args.push("--output-schema", SCHEMA_PATH);
+  }
+  args.push("-"); // prompt on stdin
+  const reducer = codexEventReducer(cwd);
+  return runCli({
+    command: "codex",
+    args,
+    cwd,
+    prompt: fullPrompt,
+    label: `codex (model=${model}, effort=${codexEffort(effort)})`,
+    onProgress,
+    handleEvent: reducer.handle,
+    finalize: reducer.finalize,
+  }).then((result) => {
+    // codex exits 0 on turn.failed; surface the error as a non-zero status so
+    // callers render a failure instead of an empty report.
+    if (result.envelope?.error && result.status === 0) {
+      return { ...result, status: 1, stderr: `${result.stderr}\n${result.envelope.error}`.trim() };
+    }
+    return result;
+  });
+}
+
 function runClaude({ prompt, cwd, model, effort, withSchema = true, onProgress }) {
   const args = [
     "-p",
@@ -453,56 +714,22 @@ function runClaude({ prompt, cwd, model, effort, withSchema = true, onProgress }
   ];
   let fullPrompt = prompt;
   if (withSchema) {
-    const schema = fs.readFileSync(SCHEMA_PATH, "utf8");
-    // Agentic -p runs don't reliably enforce --json-schema, so the schema also
-    // goes into the prompt verbatim — exact field names, exact enums.
-    fullPrompt = `${prompt}\n\n<output_schema>\nYour final message must be exactly one JSON object conforming to this JSON Schema — no markdown fences, no prose before or after, no extra or renamed fields:\n${schema}\n</output_schema>\n`;
-    args.push("--json-schema", schema);
+    fullPrompt = withSchemaPrompt(prompt);
+    args.push("--json-schema", fs.readFileSync(SCHEMA_PATH, "utf8"));
   }
-
-  return new Promise((resolve) => {
-    const started = Date.now();
-    const child = spawn("claude", args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
-    ACTIVE_CLAUDE_CHILDREN.add(child);
-    let stderr = "";
-    let lineBuffer = "";
-    let rawStdout = "";
-    let envelope = null;
-    let timedOut = false;
-    let toolCalls = 0;
-    let lastNote = "starting up";
-    let lastEmitAt = Date.now();
-
-    const emit = (text, kind = "info", eventAgeMs = 0) => {
-      lastEmitAt = Date.now();
-      onProgress?.(text, { kind, toolCalls, eventAgeMs });
-    };
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-    }, CLAUDE_TIMEOUT_MS);
-
-    // Long thinking stretches produce no events; the heartbeat keeps callers
-    // (and watching agents) from mistaking that for a stall.
-    let lastEventAtMs = Date.now();
-    const heartbeat = setInterval(() => {
-      if (Date.now() - lastEmitAt < Math.max(0, HEARTBEAT_MS - 2000)) return;
-      const eventAgeMs = Date.now() - lastEventAtMs;
-      const idleNote = eventAgeMs > 60_000 ? ` (no model events for ${formatElapsed(eventAgeMs)})` : "";
-      emit(
-        `still working — ${formatElapsed(Date.now() - started)} elapsed, ${toolCalls} tool call(s) so far, last: ${lastNote}${idleNote}`,
-        "heartbeat",
-        eventAgeMs
-      );
-    }, HEARTBEAT_MS);
-
-    const handleEvent = (event) => {
-      // Any event from the claude process counts as proof of life — including
-      // thinking-token ticks, which are the only events during long reasoning.
-      lastEventAtMs = Date.now();
+  let envelope = null;
+  return runCli({
+    command: "claude",
+    args,
+    cwd,
+    prompt: fullPrompt,
+    label: `claude (model=${model}, effort=${effort})`,
+    onProgress,
+    handleEvent(event, { emit, state }) {
+      // Any event counts as proof of life — including thinking-token ticks,
+      // which are the only events during long reasoning.
       if (event.type === "system" && event.subtype === "thinking_tokens") {
-        if (event.estimated_tokens) lastNote = `thinking (~${event.estimated_tokens} tokens)`;
+        if (event.estimated_tokens) state.lastNote = `thinking (~${event.estimated_tokens} tokens)`;
         return;
       }
       if (event.type === "system" && event.subtype === "init") {
@@ -512,61 +739,16 @@ function runClaude({ prompt, cwd, model, effort, withSchema = true, onProgress }
       if (event.type === "assistant") {
         for (const block of event.message?.content ?? []) {
           if (block.type === "tool_use") {
-            toolCalls += 1;
-            lastNote = summarizeToolUse(block.name, block.input, cwd);
-            emit(`tool #${toolCalls}: ${lastNote}`, "tool");
+            state.toolCalls += 1;
+            state.lastNote = summarizeToolUse(block.name, block.input, cwd);
+            emit(`tool #${state.toolCalls}: ${state.lastNote}`, "tool");
           }
         }
         return;
       }
-      if (event.type === "result") {
-        envelope = event;
-      }
-    };
-
-    const consume = (text) => {
-      lineBuffer += text;
-      let newline;
-      while ((newline = lineBuffer.indexOf("\n")) !== -1) {
-        const line = lineBuffer.slice(0, newline).trim();
-        lineBuffer = lineBuffer.slice(newline + 1);
-        if (!line) continue;
-        try {
-          handleEvent(JSON.parse(line));
-        } catch {
-          // non-JSON noise on stdout; ignore
-        }
-      }
-    };
-
-    const finish = (status, extraStderr = "") => {
-      ACTIVE_CLAUDE_CHILDREN.delete(child);
-      clearTimeout(timer);
-      clearInterval(heartbeat);
-      if (lineBuffer.trim()) consume("\n");
-      resolve({
-        status,
-        stdout: rawStdout,
-        stderr: extraStderr ? `${stderr}\n${extraStderr}` : stderr,
-        durationMs: Date.now() - started,
-        timedOut,
-        toolCalls,
-        envelope,
-      });
-    };
-
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      rawStdout += chunk;
-      consume(chunk);
-    });
-    child.stderr.on("data", (chunk) => (stderr += chunk));
-    child.on("error", (error) => finish(1, error.message));
-    child.on("close", (code) => finish(code ?? 1));
-
-    child.stdin.write(fullPrompt);
-    child.stdin.end();
-    emit(`claude started (model=${model}, effort=${effort}, pid=${child.pid})`);
+      if (event.type === "result") envelope = event;
+    },
+    finalize: () => envelope,
   });
 }
 
@@ -666,6 +848,9 @@ function normalizeReviewData(data) {
     next_steps: (Array.isArray(data.next_steps) ? data.next_steps : [])
       .map((s) => String(s).trim())
       .filter(Boolean),
+    disagreements: (Array.isArray(data.disagreements) ? data.disagreements : [])
+      .map((s) => String(s).trim())
+      .filter(Boolean),
   };
 }
 
@@ -680,18 +865,35 @@ function jobStampLine(meta) {
   return `Job: ${meta.jobId}${meta.createdAt ? ` | created ${meta.createdAt}` : ""}`;
 }
 
+function reviewerStampLines(meta) {
+  const lines = [];
+  for (const r of meta.reviewers ?? []) {
+    lines.push(`Reviewer: ${BACKENDS[r.backend].label} (${r.model}, effort ${r.effort}${r.role ? `, ${r.role}` : ""})`);
+  }
+  return lines;
+}
+
 function renderReport(data, meta) {
   const stamp = jobStampLine(meta);
   const lines = [
-    `# Fable ${meta.reviewLabel}`,
+    `# ${meta.reviewerLabel ?? "Fable"} ${meta.reviewLabel}`,
     "",
     `Target: ${meta.targetLabel}`,
+    ...reviewerStampLines(meta),
     ...(stamp ? [stamp] : []),
     `Verdict: ${data.verdict}`,
     "",
     data.summary,
     "",
   ];
+
+  if ((data.disagreements ?? []).length > 0) {
+    lines.push("Where they disagree:");
+    for (const d of data.disagreements) lines.push(`- ${d}`);
+    lines.push("");
+  } else if (meta.reviewers?.length > 1) {
+    lines.push("Where they disagree: nothing material.", "");
+  }
 
   const findings = [...(data.findings ?? [])].sort(
     (a, b) => (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9)
@@ -716,22 +918,32 @@ function renderReport(data, meta) {
     for (const step of data.next_steps) lines.push(`- ${step}`);
   }
 
-  if (meta.sessionIds?.length) {
-    lines.push("", `Resume interactively: claude -r ${meta.sessionIds[meta.sessionIds.length - 1]}`);
-  }
-  if (meta.costUsd != null) {
-    lines.push(`Estimated cost: $${meta.costUsd.toFixed(2)}`);
+  lines.push(...resumeLines(meta));
+  if (meta.costUsd) {
+    lines.push(`Estimated cost: $${meta.costUsd.toFixed(2)} (Claude side only; Codex usage counts against its weekly limit)`);
   }
 
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+function resumeLines(meta) {
+  const out = [];
+  const seen = new Set();
+  for (const { backend, id } of [...(meta.sessions ?? [])].reverse()) {
+    if (!id || seen.has(backend)) continue;
+    seen.add(backend);
+    out.push(`Resume ${BACKENDS[backend].label} interactively: ${BACKENDS[backend].resumeHint(id)}`);
+  }
+  return out.length ? ["", ...out] : [];
+}
+
 function renderFailure(meta, detail, rawText) {
   const stamp = jobStampLine(meta);
   const lines = [
-    `# Fable ${meta.reviewLabel}`,
+    `# ${meta.reviewerLabel ?? "Fable"} ${meta.reviewLabel}`,
     "",
     `Target: ${meta.targetLabel}`,
+    ...reviewerStampLines(meta),
     ...(stamp ? [stamp] : []),
     "The reviewer did not return a valid structured result.",
     "",
@@ -876,11 +1088,11 @@ function createReporter({ dir, job, interactive }) {
     lastJobWrite = now;
     const onDisk = readJob(dir, job.id);
     if (onDisk?.status === "cancelled") {
-      appendLog(job.logFile, "cancellation detected — stopping claude and exiting");
+      appendLog(job.logFile, "cancellation detected — stopping reviewers and exiting");
       if (interactive && !job.request?.quiet) {
         process.stderr.write("[cross-check] cancellation detected — stopping\n");
       }
-      killActiveClaudeChildren();
+      killActiveChildren();
       process.exit(1);
     }
     try {
@@ -915,7 +1127,7 @@ function createReporter({ dir, job, interactive }) {
       job.progress = { ...job.progress, phase: name };
       reporter.line(`phase: ${name}`, { force: true });
     },
-    forClaude(label) {
+    forModel(label) {
       const tag = label ? `[${label}] ` : "";
       return (text, meta = {}) =>
         reporter.line(`${tag}${text}`, { kind: meta.kind, eventAgeMs: meta.eventAgeMs ?? 0 });
@@ -946,87 +1158,118 @@ async function executeReview(request, { reporter, job }) {
     : request.adversarial
       ? "Adversarial Review"
       : "Review";
+  const backends = backendsFor(request.via);
   const meta = {
     reviewLabel,
+    reviewerLabel: reviewerLabel(request.via, request.models),
     targetLabel: target.label,
     jobId: job?.id ?? null,
     createdAt: job?.createdAt ?? null,
-    sessionIds: [],
+    reviewers: [],
+    sessions: [],
     costUsd: 0,
   };
+  const noteRun = (backend, model, effort, role, result) => {
+    meta.reviewers.push({ backend, model, effort, role });
+    if (result.envelope?.session_id) meta.sessions.push({ backend, id: result.envelope.session_id });
+    if (typeof result.envelope?.total_cost_usd === "number") meta.costUsd += result.envelope.total_cost_usd;
+  };
 
-  const runPass = async (lens, effortOverride) => {
+  const runPass = async (backend, lens) => {
     const prompt = buildReviewPrompt({
       adversarial: request.adversarial,
       context,
       focusText: request.focusText,
       lens,
+      backend,
     });
-    const result = await runClaude({
+    const model = request.models[backend];
+    const tag = [backends.length > 1 ? BACKENDS[backend].label : null, lens?.key].filter(Boolean).join(":");
+    const result = await runModel({
+      backend,
       prompt,
       cwd: context.repoRoot,
-      model: request.model,
-      effort: effortOverride ?? request.effort,
-      onProgress: reporter.forClaude(lens?.key),
+      model,
+      effort: request.effort,
+      onProgress: reporter.forModel(tag || null),
     });
-    if (result.envelope?.session_id) meta.sessionIds.push(result.envelope.session_id);
-    if (typeof result.envelope?.total_cost_usd === "number") {
-      meta.costUsd += result.envelope.total_cost_usd;
-    }
+    noteRun(backend, model, request.effort, lens ? `lens ${lens.key}` : null, result);
     reporter.line(
-      `pass${lens ? ` [${lens.key}]` : ""} finished in ${formatElapsed(result.durationMs)} (exit ${result.status}${result.timedOut ? ", timed out" : ""})`,
+      `pass${tag ? ` [${tag}]` : ""} finished in ${formatElapsed(result.durationMs)} (exit ${result.status}${result.timedOut ? ", timed out" : ""})`,
       { force: true }
     );
-    return result;
+    return { backend, lens, result };
   };
 
-  let finalResult;
-  if (request.deep) {
-    reporter.phase(`running ${LENSES.length} lens passes in parallel (correctness, security, design)`);
-    let lensesDone = 0;
-    const passes = await Promise.all(
-      LENSES.map((lens) =>
-        runPass(lens).then((result) => {
-          lensesDone += 1;
-          reporter.phase(`lens passes: ${lensesDone}/${LENSES.length} complete`);
-          return result;
-        })
-      )
+  // Every (backend × lens) pass, run concurrently; a single-backend standard
+  // review is the degenerate case of one pass with no merge.
+  const lenses = request.deep ? LENSES : [null];
+  const planned = backends.flatMap((b) => lenses.map((lens) => ({ backend: b, lens })));
+  const needsMerge = planned.length > 1;
+  if (needsMerge) {
+    reporter.phase(
+      `running ${planned.length} passes in parallel (${backends.map((b) => BACKENDS[b].label).join(" + ")}${request.deep ? " × correctness, security, design" : ""})`
     );
-    const passPayloads = passes.map((p, i) => ({
-      lens: LENSES[i].key,
-      ok: p.status === 0,
-      result: extractStructured(p.envelope),
-      error: p.status === 0 ? null : shorten(p.stderr || "claude exited non-zero", 400),
+  } else {
+    reporter.phase("review pass running (reading code, tracing data flow, verifying findings)");
+  }
+  let done = 0;
+  const passes = await Promise.all(
+    planned.map((p) =>
+      runPass(p.backend, p.lens).then((r) => {
+        done += 1;
+        if (needsMerge) reporter.phase(`passes: ${done}/${planned.length} complete`);
+        return r;
+      })
+    )
+  );
+
+  let finalResult;
+  if (!needsMerge) {
+    finalResult = passes[0].result;
+  } else {
+    const payloads = passes.map((p) => ({
+      label: [BACKENDS[p.backend].label, p.lens?.key].filter(Boolean).join(" / "),
+      backend: p.backend,
+      ok: p.result.status === 0,
+      result: extractStructured(p.result.envelope),
+      error: p.result.status === 0 ? null : shorten(p.result.stderr || `${p.backend} exited non-zero`, 400),
     }));
-    const usable = passPayloads.filter((p) => p.result);
+    const usable = payloads.filter((p) => p.result);
     if (usable.length === 0) {
-      const detail = passPayloads.map((p) => `${p.lens}: ${p.error ?? "no structured output"}`).join("; ");
-      return { ok: false, rendered: renderFailure(meta, detail, passes[0]?.envelope?.result), meta };
+      const detail = payloads.map((p) => `${p.label}: ${p.error ?? "no structured output"}`).join("; ");
+      return { ok: false, rendered: renderFailure(meta, detail, passes[0]?.result.envelope?.result), meta };
     }
-    reporter.phase(`merging ${usable.length}/${LENSES.length} lens passes into one report`);
-    const mergePrompt = interpolate(loadPrompt("merge"), {
+    const failed = payloads.filter((p) => !p.result);
+    for (const f of failed) reporter.line(`note: ${f.label} produced no usable result (${f.error ?? "no structured output"}); merging without it`, { force: true });
+
+    const usableBackends = [...new Set(usable.map((p) => p.backend))];
+    const twoReviewers = usableBackends.length > 1;
+    const merger = mergerFor(request.via);
+    reporter.phase(`merging ${usable.length}/${planned.length} passes into one report (arbiter: ${BACKENDS[merger].label})`);
+    const mergePrompt = interpolate(loadPrompt(twoReviewers ? "merge-both" : "merge"), {
+      REVIEWER: reviewerName(merger),
+      REVIEWER_NAMES: usableBackends.map(reviewerName).join(" and "),
       PASS_COUNT: String(usable.length),
       TARGET_LABEL: target.label,
       PASS_RESULTS: usable
-        .map((p) => `### Lens: ${p.lens}\n\`\`\`json\n${JSON.stringify(p.result, null, 2)}\n\`\`\``)
+        .map((p) => `### ${twoReviewers ? "Reviewer" : "Lens"}: ${p.label}\n\`\`\`json\n${JSON.stringify(p.result, null, 2)}\n\`\`\``)
         .join("\n\n"),
       REVIEW_INPUT: context.content,
     });
-    finalResult = await runClaude({
+    const mergeModel = request.models[merger];
+    finalResult = await runModel({
+      backend: merger,
       prompt: mergePrompt,
       cwd: context.repoRoot,
-      model: request.model,
+      model: mergeModel,
       effort: MERGE_EFFORT,
-      onProgress: reporter.forClaude("merge"),
+      onProgress: reporter.forModel("merge"),
     });
-    if (finalResult.envelope?.session_id) meta.sessionIds.push(finalResult.envelope.session_id);
-    if (typeof finalResult.envelope?.total_cost_usd === "number") {
-      meta.costUsd += finalResult.envelope.total_cost_usd;
+    noteRun(merger, mergeModel, MERGE_EFFORT, "arbiter", finalResult);
+    if (failed.length && !twoReviewers && backends.length > 1) {
+      meta.note = `${failed.map((f) => f.label).join(", ")} failed; report reflects one reviewer only.`;
     }
-  } else {
-    reporter.phase("review pass running (reading code, tracing data flow, verifying findings)");
-    finalResult = await runPass(null);
   }
   reporter.phase("rendering report");
 
@@ -1041,7 +1284,7 @@ async function executeReview(request, { reporter, job }) {
     const detail = finalResult.timedOut
       ? "review timed out"
       : finalResult.status !== 0
-        ? shorten(finalResult.stderr || "claude exited non-zero", 600)
+        ? shorten(finalResult.stderr || "reviewer exited non-zero", 600)
         : "output did not match the review schema";
     return {
       ok: false,
@@ -1051,10 +1294,11 @@ async function executeReview(request, { reporter, job }) {
     };
   }
 
+  if (meta.note) data.summary = `${meta.note} ${data.summary}`;
   return { ok: true, rendered: renderReport(data, meta), meta, data };
 }
 
-function buildAdvisoryPrompt(repoRoot, question) {
+function buildAdvisoryPrompt(repoRoot, question, backend = "claude") {
   const branch = getCurrentBranch(repoRoot);
   const gitStatus = gitChecked(repoRoot, ["status", "--short"]).trim() || "(clean)";
   let recentCommits = "(no commits yet)";
@@ -1064,6 +1308,7 @@ function buildAdvisoryPrompt(repoRoot, question) {
     // empty repo; keep the placeholder
   }
   const prompt = interpolate(loadPrompt("advise"), {
+    REVIEWER: reviewerName(backend),
     QUESTION: question,
     BRANCH: branch,
     // length-truncate only; shorten() would collapse the line structure
@@ -1078,59 +1323,121 @@ function buildAdvisoryPrompt(repoRoot, question) {
 async function executeAdvisory(request, { reporter, job }) {
   const repoRoot = ensureGitRepository(request.cwd);
   reporter.phase("collecting repository orientation");
-  const { prompt, branch } = buildAdvisoryPrompt(repoRoot, request.question);
+  const backends = backendsFor(request.via);
+  const { branch } = buildAdvisoryPrompt(repoRoot, request.question, backends[0]);
 
   const meta = {
     reviewLabel: "Advisory",
+    reviewerLabel: reviewerLabel(request.via, request.models),
     targetLabel: `question on ${branch}`,
     jobId: job?.id ?? null,
     createdAt: job?.createdAt ?? null,
-    sessionIds: [],
+    reviewers: [],
+    sessions: [],
     costUsd: 0,
   };
-  reporter.phase("advisor exploring the repository and forming an answer");
+  const noteRun = (backend, model, effort, role, result) => {
+    meta.reviewers.push({ backend, model, effort, role });
+    if (result.envelope?.session_id) meta.sessions.push({ backend, id: result.envelope.session_id });
+    if (typeof result.envelope?.total_cost_usd === "number") meta.costUsd += result.envelope.total_cost_usd;
+  };
+  const answerOf = (result) => (typeof result.envelope?.result === "string" ? result.envelope.result.trim() : "");
+  const failureDetail = (result, who) =>
+    result.timedOut
+      ? `${who} timed out`
+      : result.status !== 0
+        ? shorten(result.stderr || `${who} exited non-zero`, 600)
+        : `${who} returned no answer text`;
+
+  reporter.phase(
+    backends.length > 1
+      ? "both advisors exploring the repository in parallel"
+      : "advisor exploring the repository and forming an answer"
+  );
   reporter.line("expect roughly 1-6 minutes depending on the question; progress lines stream continuously");
-  const result = await runClaude({
-    prompt,
-    cwd: repoRoot,
-    model: request.model,
-    effort: request.effort,
-    withSchema: false,
-    onProgress: reporter.forClaude(null),
-  });
-  if (result.envelope?.session_id) meta.sessionIds.push(result.envelope.session_id);
-  if (typeof result.envelope?.total_cost_usd === "number") {
-    meta.costUsd += result.envelope.total_cost_usd;
-  }
-  reporter.line(
-    `advisor finished in ${formatElapsed(result.durationMs)} (exit ${result.status}${result.timedOut ? ", timed out" : ""})`,
-    { force: true }
+
+  const runs = await Promise.all(
+    backends.map(async (backend) => {
+      const model = request.models[backend];
+      const { prompt } = buildAdvisoryPrompt(repoRoot, request.question, backend);
+      const result = await runModel({
+        backend,
+        prompt,
+        cwd: repoRoot,
+        model,
+        effort: request.effort,
+        withSchema: false,
+        onProgress: reporter.forModel(backends.length > 1 ? BACKENDS[backend].label : null),
+      });
+      noteRun(backend, model, request.effort, null, result);
+      reporter.line(
+        `${BACKENDS[backend].label} finished in ${formatElapsed(result.durationMs)} (exit ${result.status}${result.timedOut ? ", timed out" : ""})`,
+        { force: true }
+      );
+      return { backend, result, answer: answerOf(result) };
+    })
   );
 
-  const answer = typeof result.envelope?.result === "string" ? result.envelope.result.trim() : "";
-  if (result.status !== 0 || result.timedOut || !answer) {
-    const detail = result.timedOut
-      ? "advisory run timed out"
-      : result.status !== 0
-        ? shorten(result.stderr || "claude exited non-zero", 600)
-        : "the advisor returned no answer text";
-    return { ok: false, rendered: renderFailure(meta, detail, answer), meta, data: null };
+  const good = runs.filter((r) => r.result.status === 0 && !r.result.timedOut && r.answer);
+  if (good.length === 0) {
+    const detail = runs.map((r) => failureDetail(r.result, BACKENDS[r.backend].label)).join("; ");
+    return { ok: false, rendered: renderFailure(meta, detail, runs[0]?.answer), meta, data: null };
+  }
+
+  let answer;
+  const sections = [];
+  if (good.length === 1) {
+    answer = good[0].answer;
+    const failed = runs.filter((r) => !good.includes(r));
+    if (failed.length) {
+      sections.push(
+        `Note: ${failed.map((r) => `${BACKENDS[r.backend].label} (${failureDetail(r.result, BACKENDS[r.backend].label)})`).join(", ")} produced no answer; showing ${BACKENDS[good[0].backend].label} only.`,
+        ""
+      );
+    }
+  } else {
+    const merger = mergerFor(request.via);
+    reporter.phase(`comparing both answers (arbiter: ${BACKENDS[merger].label})`);
+    const mergePrompt = interpolate(loadPrompt("advise-merge"), {
+      REVIEWER: reviewerName(merger),
+      REVIEWER_NAMES: good.map((r) => reviewerName(r.backend)).join(" and "),
+      QUESTION: request.question,
+      ANSWERS: good.map((r) => `### ${reviewerName(r.backend)}\n\n${r.answer}`).join("\n\n"),
+    });
+    const mergeModel = request.models[merger];
+    const merged = await runModel({
+      backend: merger,
+      prompt: mergePrompt,
+      cwd: repoRoot,
+      model: mergeModel,
+      effort: MERGE_EFFORT,
+      withSchema: false,
+      onProgress: reporter.forModel("arbiter"),
+    });
+    noteRun(merger, mergeModel, MERGE_EFFORT, "arbiter", merged);
+    const mergedAnswer = answerOf(merged);
+    if (merged.status === 0 && !merged.timedOut && mergedAnswer) {
+      answer = mergedAnswer;
+    } else {
+      sections.push(`Note: the arbiter pass failed (${failureDetail(merged, BACKENDS[merger].label)}); both raw answers follow.`, "");
+      answer = good.map((r) => `## ${reviewerName(r.backend)}\n\n${r.answer}`).join("\n\n");
+    }
   }
 
   reporter.phase("rendering answer");
   const stamp = jobStampLine(meta);
   const lines = [
-    "# Fable Advisory",
+    `# ${meta.reviewerLabel} Advisory`,
     "",
     `Question: ${request.question}`,
+    ...reviewerStampLines(meta),
     ...(stamp ? [stamp] : []),
     "",
+    ...sections,
     answer,
+    ...resumeLines(meta),
   ];
-  if (meta.sessionIds.length) {
-    lines.push("", `Resume interactively: claude -r ${meta.sessionIds[meta.sessionIds.length - 1]}`);
-  }
-  if (meta.costUsd) lines.push(`Estimated cost: $${meta.costUsd.toFixed(2)}`);
+  if (meta.costUsd) lines.push(`Estimated cost: $${meta.costUsd.toFixed(2)} (Claude side only)`);
   return {
     ok: true,
     rendered: `${lines.join("\n").trimEnd()}\n`,
@@ -1169,7 +1476,8 @@ async function runJob(dir, job, { interactive = false } = {}) {
     job.status = outcome.ok ? "completed" : "failed";
     job.verdict = outcome.data?.verdict ?? null;
     job.summary = outcome.data?.summary ? shorten(outcome.data.summary, 140) : null;
-    job.sessionIds = outcome.meta.sessionIds;
+    job.sessions = outcome.meta.sessions;
+    job.reviewers = outcome.meta.reviewers;
     job.costUsd = outcome.meta.costUsd || null;
     job.completedAt = nowIso();
     job.pid = null;
@@ -1184,7 +1492,7 @@ async function runJob(dir, job, { interactive = false } = {}) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     reporter.line(`error: ${message}`, { force: true });
-    fs.writeFileSync(job.reportFile, `# Fable ${job.kind === "advisory" ? "Advisory" : "Review"}\n\nRun failed: ${message}\n`);
+    fs.writeFileSync(job.reportFile, `# cross-check ${job.kind === "advisory" ? "Advisory" : "Review"}\n\nRun failed: ${message}\n`);
     job.status = "failed";
     job.error = message;
     job.completedAt = nowIso();
@@ -1197,21 +1505,39 @@ async function runJob(dir, job, { interactive = false } = {}) {
 // ---------------------------------------------------------------------------
 // subcommands
 
-function validateEffort(rawEffort) {
-  const effort = (rawEffort ?? DEFAULT_EFFORT).toLowerCase();
-  if (!VALID_EFFORTS.has(effort)) {
-    fail(`Unsupported effort "${rawEffort}". Use one of: low, medium, high, xhigh, max.`);
+// Effort must be valid for every backend that will run. `max` is Claude-only.
+function validateEffort(rawEffort, via) {
+  const effort = String(rawEffort ?? DEFAULT_EFFORT).toLowerCase();
+  const allowed = backendsFor(via).map((b) => BACKENDS[b].efforts);
+  const ok = EFFORT_ORDER.includes(effort) && allowed.every((set) => set.has(effort));
+  if (!ok) {
+    const common = EFFORT_ORDER.filter((e) => allowed.every((set) => set.has(e)));
+    fail(`Unsupported effort "${rawEffort}" for --via ${via}. Use one of: ${common.join(", ")}.`);
   }
   return effort;
 }
 
+// Resolves --via/--model into { via, models: { claude, codex } }. --model
+// applies to the single selected backend; with --via both it is ambiguous.
+function resolveRouting(options) {
+  const via = resolveVia(options.via);
+  const models = { claude: BACKENDS.claude.defaultModel, codex: BACKENDS.codex.defaultModel };
+  if (options.model) {
+    if (via === "both") fail("--model cannot be combined with --via both (which model would it apply to?). Use --via claude or --via codex.");
+    models[via] = options.model;
+  }
+  return { via, models };
+}
+
 function buildReviewRequest(options, positionals) {
+  const { via, models } = resolveRouting(options);
   return {
     cwd: options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd(),
     base: options.base ?? null,
     scope: options.scope ?? "auto",
-    model: options.model ?? DEFAULT_MODEL,
-    effort: validateEffort(options.effort),
+    via,
+    models,
+    effort: validateEffort(options.effort, via),
     adversarial: Boolean(options.adversarial),
     deep: Boolean(options.deep),
     quiet: Boolean(options.quiet),
@@ -1225,7 +1551,7 @@ function createJob(dir, request, { kind, targetLabel }) {
     id,
     kind,
     status: "queued",
-    title: `Fable ${kind}`,
+    title: `${reviewerLabel(request.via, request.models)} ${kind}`,
     targetLabel,
     createdAt: nowIso(),
     completedAt: null,
@@ -1265,10 +1591,11 @@ function launchBackground(dir, repoRoot, job, options) {
 
 async function handleReview(argv) {
   const { options, positionals } = parseArgs(argv, {
-    valueFlags: ["base", "scope", "model", "effort", "cwd"],
+    valueFlags: ["base", "scope", "model", "effort", "cwd", "via"],
     boolFlags: ["adversarial", "deep", "background", "json", "quiet", "dry-run"],
   });
   const request = buildReviewRequest(options, positionals);
+  const routeLine = `via ${request.via} → ${reviewerLabel(request.via, request.models)} | effort ${request.effort}${request.deep ? " | deep mode: 3 lens passes per reviewer + merge" : ""}${request.via === "both" ? ` | arbiter ${BACKENDS[mergerFor(request.via)].label}` : ""}`;
 
   // Dry run: show what would be sent to the reviewer (target + assembled
   // prompt) without calling claude or creating a job. Free to run.
@@ -1280,14 +1607,15 @@ async function handleReview(argv) {
       context,
       focusText: request.focusText,
       lens: null,
+      backend: backendsFor(request.via)[0],
     });
     process.stdout.write(
       [
-        "# Fable Review — dry run (no claude call, no job created)",
+        "# cross-check Review — dry run (no model call, no job created)",
         "",
         `Target: ${target.label}`,
         context.summary,
-        `Diff ${context.inline ? "inlined" : "too large — reviewer would self-collect"} | prompt ${Buffer.byteLength(prompt)} bytes | model ${request.model} | effort ${request.effort}${request.deep ? " | deep mode would run 3 lens passes + merge" : ""}`,
+        `Diff ${context.inline ? "inlined" : "too large — reviewer would self-collect"} | prompt ${Buffer.byteLength(prompt)} bytes | ${routeLine}`,
         "",
         "--- assembled prompt below ---",
         "",
@@ -1297,7 +1625,7 @@ async function handleReview(argv) {
     return;
   }
 
-  ensureClaudeAvailable();
+  ensureBackendsAvailable(request.via);
   const repoRoot = ensureGitRepository(request.cwd);
   const target = resolveReviewTarget(request.cwd, { base: request.base, scope: request.scope });
   const dir = jobsDir(repoRoot);
@@ -1309,6 +1637,7 @@ async function handleReview(argv) {
     return;
   }
 
+  if (!request.quiet) process.stderr.write(`[cross-check] ${routeLine}\n`);
   const outcome = await runJob(dir, job, { interactive: true });
   if (options.json) {
     process.stdout.write(`${JSON.stringify({ job: readJob(dir, job.id), result: outcome.data ?? null }, null, 2)}\n`);
@@ -1321,30 +1650,33 @@ async function handleReview(argv) {
 
 async function handleAsk(argv) {
   const { options, positionals } = parseArgs(argv, {
-    valueFlags: ["model", "effort", "cwd"],
+    valueFlags: ["model", "effort", "cwd", "via"],
     boolFlags: ["background", "json", "quiet", "dry-run"],
   });
   const question = positionals.join(" ").trim();
   if (!question) {
     fail('ask requires a question, e.g. `cross-check.mjs ask "should the job runner use worker threads?"`');
   }
+  const { via, models } = resolveRouting(options);
   const request = {
     cwd: options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd(),
-    model: options.model ?? DEFAULT_MODEL,
-    effort: validateEffort(options.effort),
+    via,
+    models,
+    effort: validateEffort(options.effort, via),
     quiet: Boolean(options.quiet),
     question,
   };
+  const routeLine = `via ${via} → ${reviewerLabel(via, models)} | effort ${request.effort}${via === "both" ? ` | arbiter ${BACKENDS[mergerFor(via)].label}` : ""}`;
 
   if (options["dry-run"]) {
     const dryRoot = ensureGitRepository(request.cwd);
-    const { prompt } = buildAdvisoryPrompt(dryRoot, request.question);
+    const { prompt } = buildAdvisoryPrompt(dryRoot, request.question, backendsFor(via)[0]);
     process.stdout.write(
       [
-        "# Fable Advisory — dry run (no claude call, no job created)",
+        "# cross-check Advisory — dry run (no model call, no job created)",
         "",
         `Question: ${request.question}`,
-        `Prompt ${Buffer.byteLength(prompt)} bytes | model ${request.model} | effort ${request.effort}`,
+        `Prompt ${Buffer.byteLength(prompt)} bytes | ${routeLine}`,
         "",
         "--- assembled prompt below ---",
         "",
@@ -1354,7 +1686,7 @@ async function handleAsk(argv) {
     return;
   }
 
-  ensureClaudeAvailable();
+  ensureBackendsAvailable(via);
   const repoRoot = ensureGitRepository(request.cwd);
   const dir = jobsDir(repoRoot);
   const job = createJob(dir, request, {
@@ -1367,6 +1699,7 @@ async function handleAsk(argv) {
     return;
   }
 
+  if (!request.quiet) process.stderr.write(`[cross-check] ${routeLine}\n`);
   const outcome = await runJob(dir, job, { interactive: true });
   if (options.json) {
     process.stdout.write(`${JSON.stringify({ job: readJob(dir, job.id), result: outcome.data ?? null }, null, 2)}\n`);
@@ -1574,6 +1907,20 @@ function ensureClaudeAvailable() {
   return result.stdout.trim();
 }
 
+function ensureCodexAvailable() {
+  const result = spawnSync("codex", ["--version"], { encoding: "utf8" });
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      "The `codex` CLI is not installed or not on PATH. Install Codex (`npm i -g @openai/codex`), then run `cross-check setup`."
+    );
+  }
+  return result.stdout.trim();
+}
+
+function ensureBackendsAvailable(via) {
+  for (const b of backendsFor(via)) BACKENDS[b].ensure();
+}
+
 function handleSetup(argv) {
   const { options } = parseArgs(argv, { boolFlags: ["json"] });
   const checks = [];
@@ -1581,24 +1928,34 @@ function handleSetup(argv) {
 
   checks.push({ name: "node", ok: true, detail: process.version });
 
-  let claudeOk = false;
-  let claudeDetail = "";
-  try {
-    claudeDetail = ensureClaudeAvailable();
-    claudeOk = true;
-  } catch (error) {
-    claudeDetail = error.message;
-    nextSteps.push("Install Claude Code: https://claude.com/claude-code");
-  }
-  checks.push({ name: "claude CLI", ok: claudeOk, detail: claudeDetail });
-
-  if (claudeOk) {
-    const auth = spawnSync("claude", ["auth", "status"], { encoding: "utf8" });
+  const cliChecks = [
+    { backend: "claude", install: "Install Claude Code: https://claude.com/claude-code", login: "Log in to Claude: run `claude` once and complete login.", auth: ["auth", "status"] },
+    { backend: "codex", install: "Install Codex: npm i -g @openai/codex", login: "Log in to Codex: run `codex login`.", auth: ["login", "status"] },
+  ];
+  for (const c of cliChecks) {
+    let ok = false;
+    let detail = "";
+    try {
+      detail = BACKENDS[c.backend].ensure();
+      ok = true;
+    } catch (error) {
+      detail = error.message;
+      nextSteps.push(c.install);
+    }
+    checks.push({ name: `${c.backend} CLI`, ok, detail });
+    if (!ok) continue;
+    const auth = spawnSync(c.backend, c.auth, { encoding: "utf8" });
     const authOut = `${auth.stdout ?? ""}${auth.stderr ?? ""}`.trim();
     const authOk = auth.status === 0;
-    checks.push({ name: "claude auth", ok: authOk, detail: shorten(authOut || "(no output)", 200) });
-    if (!authOk) nextSteps.push("Log in to Claude: run `claude` once and complete login.");
+    checks.push({ name: `${c.backend} auth`, ok: authOk, detail: shorten(authOut || "(no output)", 200) });
+    if (!authOk) nextSteps.push(c.login);
   }
+  const caller = detectCaller();
+  checks.push({
+    name: "routing",
+    ok: true,
+    detail: `caller=${caller ?? "none (plain terminal)"} → default reviewer ${BACKENDS[resolveVia(null)].label}; override with --via claude|codex|both`,
+  });
 
   const gitResult = spawnSync("git", ["--version"], { encoding: "utf8" });
   const gitOk = !gitResult.error && gitResult.status === 0;
@@ -1617,7 +1974,7 @@ function handleSetup(argv) {
     process.stdout.write(`${JSON.stringify({ ready, checks, nextSteps }, null, 2)}\n`);
     return;
   }
-  const lines = ["# Fable Check Setup", "", `Status: ${ready ? "ready" : "needs attention"}`, "", "Checks:"];
+  const lines = ["# cross-check Setup", "", `Status: ${ready ? "ready" : "needs attention"}`, "", "Checks:"];
   for (const check of checks) lines.push(`- ${check.ok ? "ok" : "MISSING"} ${check.name}: ${check.detail}`);
   if (nextSteps.length) {
     lines.push("", "Next steps:");
@@ -1630,23 +1987,27 @@ function handleSetup(argv) {
 function printUsage() {
   process.stdout.write(
     [
-      "cross-check — extensive code review and advisory powered by Claude Fable 5",
+      "cross-check — extensive code review and advisory by the other vendor's model",
       "",
       "Usage:",
       "  cross-check.mjs setup [--json]",
-      "  cross-check.mjs review [--adversarial] [--deep] [--base <ref>] [--scope auto|working-tree|branch]",
-      "                         [--effort low|medium|high|xhigh|max] [--model <model>]",
-      "                         [--background] [--json] [--quiet] [--dry-run] [focus text]",
-      "  cross-check.mjs ask    [--effort ...] [--model ...] [--background] [--json] [--quiet] [--dry-run] <question>",
+      "  cross-check.mjs review [--via claude|codex|both] [--effort low|medium|high|xhigh]",
+      "                         [--adversarial] [--deep] [--base <ref>] [--scope auto|working-tree|branch]",
+      "                         [--model <model>] [--background] [--json] [--quiet] [--dry-run] [focus text]",
+      "  cross-check.mjs ask    [--via ...] [--effort ...] [--model ...] [--background] [--json] [--quiet] [--dry-run] <question>",
       "  cross-check.mjs status [job-id] [--json]",
       "  cross-check.mjs result [job-id] [--json]",
       "  cross-check.mjs cancel [job-id] [--json]",
       "",
+      "Routing: --via wins. Otherwise a Claude Code caller gets Codex (Astra), a Codex caller gets Claude (Fable),",
+      "and a plain terminal gets Codex. `both` runs both and an arbiter (the caller's opposite) merges them,",
+      "listing where they disagree.",
+      "Effort default: medium. `max` is Claude-only.",
       "Reviews are read-only. Focus text steers the review (most useful with --adversarial).",
-      "--deep runs three parallel lens passes (correctness, security, design) plus a merge pass.",
+      "--deep runs three parallel lens passes (correctness, security, design) per reviewer plus a merge pass.",
       "`ask` answers an advisory question (architecture, tradeoffs, second opinions) with read-only repo access.",
       "Progress streams to stderr while running (tool calls + heartbeats every ~20s); --quiet suppresses it.",
-      "--dry-run prints the resolved target and assembled prompt without calling claude (free).",
+      "--dry-run prints the resolved target, routing and assembled prompt without calling any model (free).",
       "Background jobs expose live progress via `status` (phase, elapsed, last activity).",
       "",
     ].join("\n")
@@ -1706,6 +2067,15 @@ if (isDirectInvocation()) {
 }
 
 export {
+  BACKENDS,
+  detectCaller,
+  resolveVia,
+  backendsFor,
+  mergerFor,
+  reviewerLabel,
+  validateEffort,
+  codexEventReducer,
+  codexEffort,
   splitRawArgumentString,
   normalizeArgv,
   parseArgs,

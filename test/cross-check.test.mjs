@@ -22,6 +22,14 @@ const SCRIPT = path.resolve(
   "cross-check.mjs"
 );
 const {
+  BACKENDS,
+  detectCaller,
+  resolveVia,
+  backendsFor,
+  mergerFor,
+  reviewerLabel,
+  codexEventReducer,
+  codexEffort,
   splitRawArgumentString,
   normalizeArgv,
   parseArgs,
@@ -365,7 +373,7 @@ test("review --dry-run prints the assembled prompt without calling claude", () =
     env: { CROSS_CHECK_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-dr-")) },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /dry run \(no claude call, no job created\)/);
+  assert.match(result.stdout, /dry run \(no model call, no job created\)/);
   assert.match(result.stdout, /working tree diff/);
   assert.match(result.stdout, /assembled prompt below/);
   assert.match(result.stdout, /changed/); // the diff made it into the prompt
@@ -380,4 +388,141 @@ test("ask --dry-run prints the assembled advisory prompt", () => {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /is the design sound\?/);
   assert.match(result.stdout, /assembled prompt below/);
+});
+
+// ---------------------------------------------------------------------------
+// routing: who reviews whom
+
+test("routing: Claude caller gets codex, Codex caller gets claude, plain terminal gets codex", () => {
+  assert.equal(detectCaller({ CLAUDECODE: "1" }), "claude");
+  assert.equal(detectCaller({ CODEX_SESSION_ID: "abc" }), "codex");
+  assert.equal(detectCaller({ CODEX_THREAD_ID: "abc" }), "codex");
+  assert.equal(detectCaller({}), null);
+  assert.equal(resolveVia(null, { CLAUDECODE: "1" }), "codex");
+  assert.equal(resolveVia(null, { CODEX_SESSION_ID: "x" }), "claude");
+  assert.equal(resolveVia(null, {}), "codex");
+});
+
+test("routing: --via wins over detection and accepts vendor/model aliases", () => {
+  assert.equal(resolveVia("claude", { CLAUDECODE: "1" }), "claude");
+  assert.equal(resolveVia("fable", {}), "claude");
+  assert.equal(resolveVia("astra", { CODEX_SESSION_ID: "x" }), "codex");
+  assert.equal(resolveVia("BOTH", {}), "both");
+});
+
+test("routing: both-mode arbiter is the caller's opposite", () => {
+  assert.deepEqual(backendsFor("both"), ["claude", "codex"]);
+  assert.deepEqual(backendsFor("claude"), ["claude"]);
+  assert.equal(mergerFor("both", { CLAUDECODE: "1" }), "codex");
+  assert.equal(mergerFor("both", { CODEX_SESSION_ID: "x" }), "claude");
+  assert.equal(mergerFor("both", {}), "codex");
+  assert.equal(mergerFor("claude", { CLAUDECODE: "1" }), "claude");
+});
+
+test("reviewerLabel names the model only when overridden", () => {
+  const defaults = { claude: BACKENDS.claude.defaultModel, codex: BACKENDS.codex.defaultModel };
+  assert.equal(reviewerLabel("codex", defaults), "Astra");
+  assert.equal(reviewerLabel("both", defaults), "Fable + Astra");
+  assert.equal(reviewerLabel("claude", { ...defaults, claude: "claude-opus-5-5" }), "Fable (claude-opus-5-5)");
+});
+
+test("effort: max is Claude-only; both-mode takes the intersection", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-effort-"));
+  const { repo } = makeTempRepo();
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  const env = { CROSS_CHECK_STATE_DIR: dir, CLAUDECODE: "", CODEX_SESSION_ID: "" };
+  const okClaude = runCli(["review", "--dry-run", "--via", "claude", "--effort", "max"], { cwd: repo, env });
+  assert.equal(okClaude.status, 0, okClaude.stderr);
+  const badCodex = runCli(["review", "--dry-run", "--via", "codex", "--effort", "max"], { cwd: repo, env });
+  assert.notEqual(badCodex.status, 0);
+  assert.match(badCodex.stderr, /Unsupported effort "max" for --via codex/);
+  const badBoth = runCli(["review", "--dry-run", "--via", "both", "--effort", "max"], { cwd: repo, env });
+  assert.match(badBoth.stderr, /low, medium, high, xhigh\./);
+  const badModel = runCli(["review", "--dry-run", "--via", "both", "--model", "x"], { cwd: repo, env });
+  assert.match(badModel.stderr, /--model cannot be combined with --via both/);
+  assert.equal(codexEffort("max"), "xhigh");
+  assert.equal(codexEffort("low"), "low");
+});
+
+test("dry-run reports the routing line and defaults to Astra outside any agent", () => {
+  const { repo } = makeTempRepo();
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  const env = { CROSS_CHECK_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-route-")), CLAUDECODE: "", CODEX_SESSION_ID: "" };
+  const plain = runCli(["review", "--dry-run"], { cwd: repo, env });
+  assert.match(plain.stdout, /via codex → Astra \| effort medium/);
+  const fromClaude = runCli(["review", "--dry-run"], { cwd: repo, env: { ...env, CLAUDECODE: "1" } });
+  assert.match(fromClaude.stdout, /via codex → Astra/);
+  const fromCodex = runCli(["ask", "--dry-run", "why?"], { cwd: repo, env: { ...env, CODEX_SESSION_ID: "t" } });
+  assert.match(fromCodex.stdout, /via claude → Fable/);
+  const both = runCli(["review", "--dry-run", "--via", "both", "--deep"], { cwd: repo, env: { ...env, CLAUDECODE: "1" } });
+  assert.match(both.stdout, /via both → Fable \+ Astra .* arbiter Astra/);
+  // the prompt names the reviewer, never the other vendor
+  assert.match(plain.stdout, /You are Codex Astra,/);
+  assert.match(fromCodex.stdout, /You are Claude Fable,/);
+});
+
+// ---------------------------------------------------------------------------
+// codex --json event reduction (recorded shapes from codex-cli 0.142 / 0.160)
+
+test("codexEventReducer turns JSONL events into progress + a claude-shaped envelope", () => {
+  const reducer = codexEventReducer("/repo");
+  const emitted = [];
+  const state = { toolCalls: 0, lastNote: "", lastEventAtMs: 0 };
+  const ctx = { emit: (text, kind) => emitted.push([kind ?? "info", text]), state };
+  const events = [
+    { type: "thread.started", thread_id: "019b-thread" },
+    { type: "turn.started" },
+    { type: "item.started", item: { id: "item_0", type: "command_execution", command: "/bin/bash -lc 'git diff'", status: "in_progress" } },
+    { type: "item.completed", item: { id: "item_0", type: "command_execution", command: "/bin/bash -lc 'git diff'", exit_code: 0, status: "completed" } },
+    { type: "item.completed", item: { id: "item_1", type: "reasoning", text: "..." } },
+    { type: "item.completed", item: { id: "item_2", type: "agent_message", text: "draft" } },
+    { type: "item.completed", item: { id: "item_3", type: "agent_message", text: "{\"verdict\":\"approve\",\"summary\":\"ok\",\"findings\":[],\"next_steps\":[]}" } },
+    { type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } },
+  ];
+  for (const e of events) reducer.handle(e, ctx);
+  const envelope = reducer.finalize();
+  assert.equal(state.toolCalls, 1);
+  assert.equal(envelope.session_id, "019b-thread");
+  assert.equal(envelope.error, null);
+  assert.deepEqual(envelope.usage, { input_tokens: 10, output_tokens: 5 });
+  assert.match(emitted.find(([k]) => k === "tool")[1], /tool #1: running: .*git diff/);
+  // the LAST agent_message is the answer; extractStructured parses it like a claude envelope
+  const data = normalizeReviewData(extractStructured(envelope));
+  assert.equal(data.verdict, "approve");
+});
+
+test("codexEventReducer surfaces turn.failed as an envelope error", () => {
+  const reducer = codexEventReducer("/repo");
+  const ctx = { emit: () => {}, state: { toolCalls: 0, lastNote: "", lastEventAtMs: 0 } };
+  reducer.handle({ type: "turn.failed", error: { message: "usage limit reached" } }, ctx);
+  assert.equal(reducer.finalize().error, "usage limit reached");
+});
+
+test("normalizeReviewData keeps disagreements and renderReport prints them first", () => {
+  const data = normalizeReviewData({
+    verdict: "needs-attention",
+    summary: "Reviewers mostly agree.",
+    findings: [],
+    next_steps: [],
+    disagreements: ["Only Astra flagged the retry loop (kept, medium).", ""],
+  });
+  assert.deepEqual(data.disagreements, ["Only Astra flagged the retry loop (kept, medium)."]);
+  const meta = {
+    reviewLabel: "Review",
+    reviewerLabel: "Fable + Astra",
+    targetLabel: "working tree diff",
+    reviewers: [
+      { backend: "claude", model: "claude-fable-5", effort: "medium", role: null },
+      { backend: "codex", model: "gpt-6-astra", effort: "medium", role: null },
+      { backend: "codex", model: "gpt-6-astra", effort: "high", role: "arbiter" },
+    ],
+    sessions: [{ backend: "claude", id: "sess-1" }, { backend: "codex", id: "thr-1" }],
+    costUsd: 0,
+  };
+  const out = renderReport(data, meta);
+  assert.match(out, /^# Fable \+ Astra Review/);
+  assert.match(out, /Reviewer: Astra \(gpt-6-astra, effort high, arbiter\)/);
+  assert.ok(out.indexOf("Where they disagree:") < out.indexOf("No material findings."));
+  assert.match(out, /Resume Fable interactively: claude -r sess-1/);
+  assert.match(out, /Resume Astra interactively: codex exec resume thr-1/);
 });
