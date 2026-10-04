@@ -1230,13 +1230,22 @@ async function executeReview(request, { reporter, job }) {
   if (!needsMerge) {
     finalResult = passes[0].result;
   } else {
-    const payloads = passes.map((p) => ({
-      label: [BACKENDS[p.backend].label, p.lens?.key].filter(Boolean).join(" / "),
-      backend: p.backend,
-      ok: p.result.status === 0,
-      result: extractStructured(p.result.envelope),
-      error: p.result.status === 0 ? null : shorten(p.result.stderr || `${p.backend} exited non-zero`, 400),
-    }));
+    // A pass only counts if the process succeeded AND produced a parseable
+    // result; a structured message followed by a failure is not a review.
+    const payloads = passes.map((p) => {
+      const ok = p.result.status === 0 && !p.result.timedOut;
+      return {
+        label: [BACKENDS[p.backend].label, p.lens?.key].filter(Boolean).join(" / "),
+        backend: p.backend,
+        ok,
+        result: ok ? extractStructured(p.result.envelope) : null,
+        error: p.result.timedOut
+          ? "timed out"
+          : !ok
+            ? shorten(p.result.stderr || `${p.backend} exited non-zero`, 400)
+            : null,
+      };
+    });
     const usable = payloads.filter((p) => p.result);
     if (usable.length === 0) {
       const detail = payloads.map((p) => `${p.label}: ${p.error ?? "no structured output"}`).join("; ");
@@ -1247,7 +1256,19 @@ async function executeReview(request, { reporter, job }) {
 
     const usableBackends = [...new Set(usable.map((p) => p.backend))];
     const twoReviewers = usableBackends.length > 1;
-    const merger = mergerFor(request.via);
+    const survivorNote = failed.length
+      ? `${failed.map((f) => f.label).join(", ")} failed; report reflects ${usableBackends.map((b) => BACKENDS[b].label).join(" + ")} only.`
+      : null;
+    if (usable.length === 1) {
+      // One surviving standard pass: nothing to merge, and calling a possibly
+      // broken arbiter would throw the good review away.
+      finalResult = passes.find((p) => p.backend === usable[0].backend && p.lens === null)?.result ?? passes[0].result;
+      meta.note = survivorNote;
+    } else {
+    // The arbiter must be a backend that just worked; the designated one may
+    // be the side that failed (quota, login), so fall back to a survivor.
+    const designated = mergerFor(request.via);
+    const merger = usableBackends.includes(designated) ? designated : usableBackends[0];
     reporter.phase(`merging ${usable.length}/${planned.length} passes into one report (arbiter: ${BACKENDS[merger].label})`);
     const mergePrompt = interpolate(loadPrompt(twoReviewers ? "merge-both" : "merge"), {
       REVIEWER: reviewerName(merger),
@@ -1269,13 +1290,13 @@ async function executeReview(request, { reporter, job }) {
       onProgress: reporter.forModel("merge"),
     });
     noteRun(merger, mergeModel, MERGE_EFFORT, "arbiter", finalResult);
-    if (failed.length && !twoReviewers && backends.length > 1) {
-      meta.note = `${failed.map((f) => f.label).join(", ")} failed; report reflects one reviewer only.`;
+    if (backends.length > 1) meta.note = survivorNote;
     }
   }
   reporter.phase("rendering report");
 
-  const raw = extractStructured(finalResult.envelope);
+  const finalOk = finalResult.status === 0 && !finalResult.timedOut;
+  const raw = finalOk ? extractStructured(finalResult.envelope) : null;
   const looksLikeReview =
     raw &&
     (typeof raw.verdict === "string" ||
@@ -2070,6 +2091,7 @@ if (isDirectInvocation()) {
 
 export {
   BACKENDS,
+  executeReview,
   detectCaller,
   resolveVia,
   backendsFor,

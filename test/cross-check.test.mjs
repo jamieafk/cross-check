@@ -23,6 +23,7 @@ const SCRIPT = path.resolve(
 );
 const {
   BACKENDS,
+  executeReview,
   detectCaller,
   resolveVia,
   backendsFor,
@@ -430,7 +431,7 @@ test("effort: max is Claude-only; both-mode takes the intersection", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-effort-"));
   const { repo } = makeTempRepo();
   fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
-  const env = { CROSS_CHECK_STATE_DIR: dir, CLAUDECODE: "", CODEX_SESSION_ID: "" };
+  const env = { CROSS_CHECK_STATE_DIR: dir, CLAUDECODE: "", CODEX_SESSION_ID: "", CODEX_THREAD_ID: "" };
   const okClaude = runCli(["review", "--dry-run", "--via", "claude", "--effort", "max"], { cwd: repo, env });
   assert.equal(okClaude.status, 0, okClaude.stderr);
   const badCodex = runCli(["review", "--dry-run", "--via", "codex", "--effort", "max"], { cwd: repo, env });
@@ -447,7 +448,7 @@ test("effort: max is Claude-only; both-mode takes the intersection", () => {
 test("dry-run reports the routing line and defaults to Astra outside any agent", () => {
   const { repo } = makeTempRepo();
   fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
-  const env = { CROSS_CHECK_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-route-")), CLAUDECODE: "", CODEX_SESSION_ID: "" };
+  const env = { CROSS_CHECK_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-route-")), CLAUDECODE: "", CODEX_SESSION_ID: "", CODEX_THREAD_ID: "" };
   const plain = runCli(["review", "--dry-run"], { cwd: repo, env });
   assert.match(plain.stdout, /via codex → Astra \| effort medium/);
   const fromClaude = runCli(["review", "--dry-run"], { cwd: repo, env: { ...env, CLAUDECODE: "1" } });
@@ -525,4 +526,85 @@ test("normalizeReviewData keeps disagreements and renderReport prints them first
   assert.ok(out.indexOf("Where they disagree:") < out.indexOf("No material findings."));
   assert.match(out, /Resume Fable interactively: claude -r sess-1/);
   assert.match(out, /Resume Astra interactively: codex exec resume thr-1/);
+});
+
+// ---------------------------------------------------------------------------
+// failure handling with stubbed backends (no CLI calls)
+
+const GOOD_REVIEW = { verdict: "needs-attention", summary: "one bug", findings: [], next_steps: [], disagreements: [] };
+const APPROVE_REVIEW = { verdict: "approve", summary: "fine", findings: [], next_steps: [], disagreements: [] };
+function stubResult({ status = 0, timedOut = false, data = GOOD_REVIEW, stderr = "" } = {}) {
+  return { status, stdout: "", stderr, durationMs: 1, timedOut, toolCalls: 0, envelope: { result: JSON.stringify(data), session_id: `s-${status}` } };
+}
+function silentReporter() {
+  return { line() {}, phase() {}, forModel() { return () => {}; } };
+}
+function withStubs(stubs, fn) {
+  const saved = { claude: BACKENDS.claude.run, codex: BACKENDS.codex.run };
+  BACKENDS.claude.run = stubs.claude ?? saved.claude;
+  BACKENDS.codex.run = stubs.codex ?? saved.codex;
+  return Promise.resolve().then(fn).finally(() => {
+    BACKENDS.claude.run = saved.claude;
+    BACKENDS.codex.run = saved.codex;
+  });
+}
+function reviewRequest(repo, via) {
+  return { cwd: repo, base: null, scope: "auto", via, models: { claude: "claude-fable-5", codex: "gpt-6-astra" }, effort: "low", adversarial: false, deep: false, quiet: true, focusText: "" };
+}
+
+test("a structured message followed by a failed exit is not accepted as a review", async () => {
+  const { repo } = makeTempRepo();
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  await withStubs(
+    { codex: async () => stubResult({ status: 1, data: APPROVE_REVIEW, stderr: "usage limit reached" }) },
+    async () => {
+      const out = await executeReview(reviewRequest(repo, "codex"), { reporter: silentReporter(), job: null });
+      assert.equal(out.ok, false);
+      assert.match(out.rendered, /usage limit reached/);
+      assert.doesNotMatch(out.rendered, /Verdict: approve/);
+    }
+  );
+});
+
+test("both-mode keeps the surviving review and never arbitrates on the failed backend", async () => {
+  const { repo } = makeTempRepo();
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  const calls = [];
+  await withStubs(
+    {
+      claude: async () => { calls.push("claude"); return stubResult(); },
+      codex: async () => { calls.push("codex"); return stubResult({ status: 1, data: APPROVE_REVIEW, stderr: "quota" }); },
+    },
+    async () => {
+      // plain terminal → designated arbiter is codex, which just failed
+      process.env.CLAUDECODE = ""; process.env.CODEX_SESSION_ID = ""; process.env.CODEX_THREAD_ID = "";
+      const out = await executeReview(reviewRequest(repo, "both"), { reporter: silentReporter(), job: null });
+      assert.equal(out.ok, true, out.rendered);
+      assert.deepEqual(calls, ["claude", "codex"]); // no third (arbiter) call
+      assert.match(out.rendered, /Astra failed; report reflects Fable only/);
+      assert.match(out.rendered, /Verdict: needs-attention/);
+      assert.equal(out.meta.reviewers.filter((r) => r.role === "arbiter").length, 0);
+    }
+  );
+});
+
+test("both-mode deep review merges on a surviving backend when the designated arbiter failed", async () => {
+  const { repo } = makeTempRepo();
+  fs.writeFileSync(path.join(repo, "a.txt"), "changed\n");
+  const calls = [];
+  await withStubs(
+    {
+      claude: async () => { calls.push("claude"); return stubResult(); },
+      codex: async () => { calls.push("codex"); return stubResult({ status: 1, stderr: "quota" }); },
+    },
+    async () => {
+      process.env.CLAUDECODE = ""; process.env.CODEX_SESSION_ID = ""; process.env.CODEX_THREAD_ID = "";
+      const out = await executeReview({ ...reviewRequest(repo, "both"), deep: true }, { reporter: silentReporter(), job: null });
+      assert.equal(out.ok, true, out.rendered);
+      const arbiter = out.meta.reviewers.find((r) => r.role === "arbiter");
+      assert.equal(arbiter.backend, "claude");
+      assert.equal(calls.filter((c) => c === "claude").length, 4); // 3 lenses + merge
+      assert.equal(calls.filter((c) => c === "codex").length, 3);
+    }
+  );
 });
