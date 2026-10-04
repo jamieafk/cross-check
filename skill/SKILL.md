@@ -15,21 +15,26 @@ All commands run from the repository being reviewed. `<skill-dir>` is this skill
 - Return the script's output to the user **verbatim** — do not paraphrase, summarize, or filter the findings or the answer.
 - After presenting the output, you may offer to act on it as a separate follow-up.
 
-## Before running: always show the menu
+## Before running: ask three multiple-choice questions
 
-The user will not remember the options, so **every invocation starts with this menu** (fill in the detected default reviewer from Routing, and pre-select anything the user already said). Ask it as one message, let them answer in a few words ("2, both, high"), then run.
+The user will not remember flags, so **every invocation starts with these three questions**. In Claude Code use the AskUserQuestion tool (one call, three questions, defaults listed first). In Codex, print them as numbered lists and wait for the answer. Skip any question the user already answered in their request.
 
-```
-cross-check — pick one per line (defaults in [brackets]):
-1. What:      [review]  review · adversarial <focus> · deep · ask "<question>"
-2. Reviewer:  [Astra]   auto (the other vendor) · fable · astra · both (two reviewers + arbiter, lists disagreements)
-3. Effort:    [medium]  low (fast, cheap) · medium · high (pre-ship) · xhigh (most extensive)
-4. Run:       [foreground]  background (for deep, both, or big diffs)
-```
+**1. What do you want?**
+- Review my changes *(default)*
+- Try to break my changes (adversarial) — they can add what to attack
+- Deep review (3 angles, slowest, most thorough)
+- Ask a question about the codebase
 
-Map the answers to flags: 1 → `review` / `review --adversarial <focus>` / `review --deep` / `ask "<question>"`; 2 → nothing / `--via claude` / `--via codex` / `--via both`; 3 → `--effort <level>`; 4 → `--background`. Then echo the exact command you are about to run so the user learns it. If the user gives a complete instruction up front ("adversarial review with both, high, background"), skip the menu and just echo the command.
+**2. Who reviews?**
+- The other model *(default — Astra from Claude Code, Fable from Codex)*
+- Both models, and show me where they disagree
 
-`max` effort is Claude-only and not on the menu; use it only if the user asks for it by name.
+**3. How thorough?**
+- Normal *(default)*
+- Quick (small change, cheapest)
+- Thorough (pre-ship, anything subtle)
+
+Mapping: Q1 → `review` / `review --adversarial <focus>` / `review --deep` / `ask "<question>"`. Q2 → nothing / `--via both`. Q3 → `--effort medium` / `low` / `high`. Add `--background` yourself for deep, both, or a large diff; don't ask. Then say in one line what you're running (reviewer, mode, effort) and run it. `xhigh` and Claude-only `max` are available when the user asks for them by name.
 
 ## Routing
 
