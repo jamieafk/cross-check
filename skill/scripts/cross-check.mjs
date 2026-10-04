@@ -686,10 +686,10 @@ function runCodex({ prompt, cwd, model, effort, withSchema = true, onProgress })
     handleEvent: reducer.handle,
     finalize: reducer.finalize,
   }).then((result) => {
-    // codex exits 0 on turn.failed; surface the error as a non-zero status so
-    // callers render a failure instead of an empty report.
-    if (result.envelope?.error && result.status === 0) {
-      return { ...result, status: 1, stderr: `${result.stderr}\n${result.envelope.error}`.trim() };
+    // Surface turn.failed/error events as a non-zero status with the message in
+    // stderr, so callers render a failure with a reason instead of an empty report.
+    if (result.envelope?.error) {
+      return { ...result, status: result.status || 1, stderr: `${result.stderr}\n${result.envelope.error}`.trim() };
     }
     return result;
   });
@@ -715,7 +715,9 @@ function runClaude({ prompt, cwd, model, effort, withSchema = true, onProgress }
   let fullPrompt = prompt;
   if (withSchema) {
     fullPrompt = withSchemaPrompt(prompt);
-    args.push("--json-schema", fs.readFileSync(SCHEMA_PATH, "utf8"));
+    // Claude Code's --json-schema validator rejects the `$schema` draft key.
+    const { $schema: _drop, ...schema } = JSON.parse(fs.readFileSync(SCHEMA_PATH, "utf8"));
+    args.push("--json-schema", JSON.stringify(schema));
   }
   let envelope = null;
   return runCli({

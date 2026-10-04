@@ -6,7 +6,8 @@
     "verdict",
     "summary",
     "findings",
-    "next_steps"
+    "next_steps",
+    "disagreements"
   ],
   "properties": {
     "verdict": {
@@ -103,7 +104,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Only in both-mode merges: one line per material disagreement between the two reviewers."
+      "description": "One line per material disagreement between two reviewers (both-mode merges). Empty for single-reviewer runs."
     }
   }
 }
