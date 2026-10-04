@@ -878,7 +878,7 @@ function reviewerStampLines(meta) {
 function renderReport(data, meta) {
   const stamp = jobStampLine(meta);
   const lines = [
-    `# ${meta.reviewerLabel ?? "Fable"} ${meta.reviewLabel}`,
+    `# ${meta.reviewerLabel ?? "cross-check"} ${meta.reviewLabel}`,
     "",
     `Target: ${meta.targetLabel}`,
     ...reviewerStampLines(meta),
@@ -942,7 +942,7 @@ function resumeLines(meta) {
 function renderFailure(meta, detail, rawText) {
   const stamp = jobStampLine(meta);
   const lines = [
-    `# ${meta.reviewerLabel ?? "Fable"} ${meta.reviewLabel}`,
+    `# ${meta.reviewerLabel ?? "cross-check"} ${meta.reviewLabel}`,
     "",
     `Target: ${meta.targetLabel}`,
     ...reviewerStampLines(meta),
@@ -1061,7 +1061,7 @@ function reconcileDeadJob(dir, job) {
     if (job.reportFile && !fs.existsSync(job.reportFile)) {
       fs.writeFileSync(
         job.reportFile,
-        `# Fable ${job.kind === "advisory" ? "Advisory" : "Review"}\n\nJob: ${job.id} | created ${job.createdAt}\n\nRun failed: the worker process died before finishing (machine sleep, reboot, or it was killed). Re-run the ${job.kind === "advisory" ? "question" : "review"} to get a report.\n`
+        `# cross-check ${job.kind === "advisory" ? "Advisory" : "Review"}\n\nJob: ${job.id} | created ${job.createdAt}\n\nRun failed: the worker process died before finishing (machine sleep, reboot, or it was killed). Re-run the ${job.kind === "advisory" ? "question" : "review"} to get a report.\n`
       );
     }
     writeJob(dir, job);
@@ -1618,6 +1618,11 @@ async function handleReview(argv) {
     boolFlags: ["adversarial", "deep", "background", "json", "quiet", "dry-run"],
   });
   const request = buildReviewRequest(options, positionals);
+  const guardEmptyTarget = (context, target) => {
+    if (context.fileCount === 0) {
+      fail(`Nothing to review: ${target.label} contains no changed files. Make changes or commit ahead of the base branch first (ask has no such requirement).`);
+    }
+  };
   const routeLine = `via ${request.via} → ${reviewerLabel(request.via, request.models)} | effort ${request.effort}${request.deep ? " | deep mode: 3 lens passes per reviewer + merge" : ""}${request.via === "both" ? ` | arbiter ${BACKENDS[mergerFor(request.via)].label}` : ""}`;
 
   // Dry run: show what would be sent to the reviewer (target + assembled
@@ -1625,6 +1630,7 @@ async function handleReview(argv) {
   if (options["dry-run"]) {
     const target = resolveReviewTarget(request.cwd, { base: request.base, scope: request.scope });
     const context = collectReviewContext(request.cwd, target);
+    guardEmptyTarget(context, target);
     const prompt = buildReviewPrompt({
       adversarial: request.adversarial,
       context,
@@ -1640,7 +1646,9 @@ async function handleReview(argv) {
         context.summary,
         `Diff ${context.inline ? "inlined" : "too large — reviewer would self-collect"} | prompt ${Buffer.byteLength(prompt)} bytes | ${routeLine}`,
         "",
-        "--- assembled prompt below ---",
+        request.via === "both"
+          ? `--- assembled prompt below (shown for ${BACKENDS[backendsFor(request.via)[0]].label}; the other reviewer receives the same prompt with its own name) ---`
+          : "--- assembled prompt below ---",
         "",
         prompt,
       ].join("\n")
@@ -1651,6 +1659,7 @@ async function handleReview(argv) {
   ensureBackendsAvailable(request.via);
   const repoRoot = ensureGitRepository(request.cwd);
   const target = resolveReviewTarget(request.cwd, { base: request.base, scope: request.scope });
+  guardEmptyTarget(collectReviewContext(request.cwd, target), target);
   const dir = jobsDir(repoRoot);
   const kind = request.deep ? "deep-review" : request.adversarial ? "adversarial-review" : "review";
   const job = createJob(dir, request, { kind, targetLabel: target.label });
@@ -1789,7 +1798,7 @@ function handleStatus(argv) {
     const job = reconcileDeadJob(dir, readJob(dir, positionals[0]));
     if (!job) fail(`No job ${positionals[0]} found for this repository.`);
     process.stdout.write(
-      options.json ? `${JSON.stringify(job, null, 2)}\n` : `# Fable Job Status\n\n${describeJob(job)}\n`
+      options.json ? `${JSON.stringify(job, null, 2)}\n` : `# cross-check Job Status\n\n${describeJob(job)}\n`
     );
     return;
   }
@@ -1805,7 +1814,7 @@ function handleStatus(argv) {
   }
   const active = jobs.filter((j) => j.status === "running" || j.status === "queued");
   const recent = jobs.filter((j) => !(j.status === "running" || j.status === "queued")).slice(0, 5);
-  const lines = ["# Fable Status", ""];
+  const lines = ["# cross-check Status", ""];
   if (active.length) {
     lines.push("Active:");
     for (const job of active) lines.push(describeJob(job));
@@ -1992,13 +2001,20 @@ function handleSetup(argv) {
     checks.push({ name: "state dir", ok: false, detail: String(error) });
   }
 
-  const ready = checks.every((c) => c.ok);
+  // Ready means the default route can run. The other vendor's CLI is optional
+  // (only needed when routing to it or using --via both), so it's a warning.
+  const needed = BACKENDS[resolveVia(null)].key;
+  const required = checks.filter((c) => !/^(claude|codex) /.test(c.name) || c.name.startsWith(`${needed} `));
+  const ready = required.every((c) => c.ok);
+  for (const c of checks) {
+    if (!c.ok && /^(claude|codex) /.test(c.name) && !c.name.startsWith(`${needed} `)) c.optional = true;
+  }
   if (options.json) {
     process.stdout.write(`${JSON.stringify({ ready, checks, nextSteps }, null, 2)}\n`);
     return;
   }
   const lines = ["# cross-check Setup", "", `Status: ${ready ? "ready" : "needs attention"}`, "", "Checks:"];
-  for (const check of checks) lines.push(`- ${check.ok ? "ok" : "MISSING"} ${check.name}: ${check.detail}`);
+  for (const check of checks) lines.push(`- ${check.ok ? "ok" : check.optional ? "optional" : "MISSING"} ${check.name}: ${check.detail}`);
   if (nextSteps.length) {
     lines.push("", "Next steps:");
     for (const step of nextSteps) lines.push(`- ${step}`);

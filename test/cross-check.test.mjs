@@ -608,3 +608,11 @@ test("both-mode deep review merges on a surviving backend when the designated ar
     }
   );
 });
+
+test("review refuses an empty target instead of running a paid review of nothing", () => {
+  const { repo } = makeTempRepo(); // clean tree on the default branch
+  const env = { CROSS_CHECK_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "cross-check-test-empty-")), CLAUDECODE: "", CODEX_SESSION_ID: "", CODEX_THREAD_ID: "" };
+  const result = runCli(["review", "--dry-run"], { cwd: repo, env });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Nothing to review/);
+});
