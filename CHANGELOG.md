@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-04 — cross-check: review by the other vendor's model
+
+**TL;DR: fable-check became cross-check. Claude Code callers now get a Codex (gpt-6-astra) review, Codex callers get a Claude (Fable) review, and `--via both` runs both with an arbiter that lists where they disagree.**
+
+- **Codex backend.** `codex exec --sandbox read-only --json --output-schema` with the same prompts, progress stream, job runner and report format as the Claude path.
+- **Caller-aware routing.** `--via claude|codex|both`; without it, the script picks the caller's opposite (Astra from a plain terminal). Every report header names reviewer, model and effort.
+- **Both mode.** Every pass runs on both models concurrently; the caller's opposite model arbitrates and the report opens with "Where they disagree". One side failing still yields the other's report with a note. Works for `review`, `--deep` and `ask`.
+- **Effort.** Default is now `medium`; the skill prompt makes the agent offer low / medium / high. `max` stays Claude-only.
+- **Fixes:** Claude Code's `--json-schema` now rejects the `$schema` key (stripped); OpenAI strict mode needs every property in `required` (schema updated); codex `turn.failed` messages now surface in the report.
+- Renamed everything (`cross-check.mjs`, `~/.cross-check/jobs`, `CROSS_CHECK_*` env; the old `FABLE_CHECK_STATE_DIR` still works). Repo moved to github.com/jamieafk/cross-check (old URL redirects).
+
+
 ## 2026-07-17 — Trust fixes + free offline tests
 
 **TL;DR: `result` can no longer hand you a stale report, dead background jobs recover cleanly, and the fragile parsing layer now has a free test suite.**

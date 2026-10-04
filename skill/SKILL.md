@@ -1,73 +1,91 @@
 ---
-name: fable-check
-description: Run an extensive code review or get advisory input from Claude Fable 5 (Anthropic's most capable model). Use when the user asks for a code review, a fable check, a second opinion on changes, a pre-ship review, an adversarial/deep review of the working tree or a branch — or wants Fable's advice on an architecture choice, design tradeoff, plan, or technical decision about the codebase. Read-only — it never modifies code.
+name: cross-check
+description: Get a code review or advisory answer from the *other* vendor's frontier model. From Claude Code it reviews with Codex (gpt-6-astra, "Astra"); from Codex it reviews with Claude (Fable); `both` runs the two and an arbiter lists where they disagree. Use when the user asks for a cross-check, a second opinion, a code review, a pre-ship / adversarial / deep review of the working tree or a branch, or wants independent advice on an architecture choice, design tradeoff, plan, or technical decision. Read-only — it never modifies code.
 ---
 
-# fable-check — Fable 5 code review & advisory
+# cross-check — review by the other model
 
-Run a structured, read-only code review — or ask an advisory question — using the Claude Fable 5 model via the local `claude` CLI. The reviewer/advisor gets read-only tools (Read/Grep/Glob plus read-only git commands), so it verifies its claims against the real code instead of guessing.
+Runs a structured, read-only code review or advisory question through a frontier model from the *other* vendor, so the model that wrote the code never grades its own work. The reviewer gets read-only tools (file reads, grep, read-only git), so it verifies claims against the real code instead of guessing.
 
-All commands below run from the repository being reviewed. `<skill-dir>` is this skill's directory (the folder containing this SKILL.md).
+All commands run from the repository being reviewed. `<skill-dir>` is this skill's directory (the folder containing this SKILL.md).
 
 ## Core constraint
 
 - This skill is **read-only**. Never fix issues, apply patches, or imply you are about to make changes as part of running it.
-- Return the script's output to the user **verbatim** — do not paraphrase, summarize, or filter the findings or the advisory answer.
-- After presenting the output, you may offer to act on it as a separate follow-up if the user wants.
+- Return the script's output to the user **verbatim** — do not paraphrase, summarize, or filter the findings or the answer.
+- After presenting the output, you may offer to act on it as a separate follow-up.
+
+## Before running: pick the effort
+
+Ask the user which effort to use unless they already said: **low** (fast, cheapest; fine for small diffs), **medium** (default; solid everyday review), **high** (thorough; pre-ship or anything subtle). Offer exactly those three. `xhigh` exists for when the user asks for the most extensive review possible; `max` is Claude-only. Pass the choice as `--effort <level>`.
+
+Also mention which model will review (see Routing) so the user can override with `--via`.
+
+## Routing
+
+The script picks the reviewer automatically: inside Claude Code → **Astra** (Codex); inside Codex → **Fable** (Claude); plain terminal → Astra. Override with `--via claude`, `--via codex`, or `--via both`.
+
+`--via both` runs both reviewers on the same change concurrently, then an arbiter (the caller's opposite model) merges them into one report whose first section is **Where they disagree**. Use it when the stakes justify two opinions; it costs both usage budgets.
 
 ## Commands
 
-Standard review of current work (auto-detects: dirty working tree → working-tree diff; clean tree → branch vs default branch):
+Standard review of current work (auto-detects: dirty tree → working-tree diff; clean tree → branch vs default branch):
 
 ```bash
-node "<skill-dir>/scripts/fable-check.mjs" review
+node "<skill-dir>/scripts/cross-check.mjs" review --effort medium
 ```
 
 Review a branch against a base:
 
 ```bash
-node "<skill-dir>/scripts/fable-check.mjs" review --base main
+node "<skill-dir>/scripts/cross-check.mjs" review --base main
 ```
 
 Adversarial review (skeptical, tries to block the change; accepts steering text):
 
 ```bash
-node "<skill-dir>/scripts/fable-check.mjs" review --adversarial challenge the caching and retry design
+node "<skill-dir>/scripts/cross-check.mjs" review --adversarial challenge the caching and retry design
 ```
 
 Deep review (three parallel lens passes — correctness, security/data-safety, design/failure-modes — merged into one report; the most extensive and most expensive mode):
 
 ```bash
-node "<skill-dir>/scripts/fable-check.mjs" review --deep
+node "<skill-dir>/scripts/cross-check.mjs" review --deep
 ```
 
-Advisory — ask Fable a question instead of requesting a review (architecture choices, design tradeoffs, "is this plan sound?", second opinions on a decision, "how should X work?"). The advisor explores the repo with read-only tools and answers in prose with one clear recommendation:
+Both reviewers with a disagreement summary:
 
 ```bash
-node "<skill-dir>/scripts/fable-check.mjs" ask "should the job runner move to worker threads, or is the detached-process design right?"
+node "<skill-dir>/scripts/cross-check.mjs" review --via both
 ```
 
-Other flags (both `review` and `ask`): `--effort low|medium|high|xhigh|max` (default `xhigh`), `--model <model>` (default `claude-fable-5`), `--background`, `--json`, `--quiet` (suppress progress stream). `review` also takes `--scope auto|working-tree|branch` and `--base <ref>`.
+Advisory — ask a question instead of requesting a review (architecture choices, design tradeoffs, "is this plan sound?", second opinions). The advisor explores the repo read-only and answers in prose with one clear recommendation. With `--via both`, the arbiter returns a recommendation plus where the two advisors agree and disagree:
+
+```bash
+node "<skill-dir>/scripts/cross-check.mjs" ask "should the job runner move to worker threads, or is the detached-process design right?"
+```
+
+Other flags (both `review` and `ask`): `--via claude|codex|both`, `--effort low|medium|high|xhigh` (default `medium`), `--model <model>` (overrides the single selected backend's model; not allowed with `both`), `--background`, `--json`, `--quiet`, `--dry-run` (prints routing, target and prompt; calls no model). `review` also takes `--scope auto|working-tree|branch` and `--base <ref>`.
 
 ## Progress reporting — IMPORTANT for invoking agents
 
-Runs take minutes, but they are **never silent**. While running, the script streams continuous progress to **stderr** (stdout stays clean for the final report):
+Runs take minutes, but they are **never silent**. The script streams progress to **stderr** (stdout stays clean for the final report):
 
-- a startup banner with the target and an expected duration range,
-- a line for every tool call the reviewer makes (`tool #14: reading src/foo.js`),
-- phase changes (`phase: review pass running`, `phase: lens passes: 2/3 complete`, `phase: merging ...`),
-- a heartbeat at least every ~20 seconds during thinking stretches (`still working — 3m40s elapsed, 14 tool call(s) so far, last: ...`).
+- a routing line (`via codex → Astra | effort medium`) and a startup banner with the target,
+- a line for every tool call the reviewer makes (`tool #14: running: git diff ...`), tagged by reviewer in `both` mode,
+- phase changes (`phase: passes: 2/6 complete`, `phase: merging ... (arbiter: Astra)`),
+- a heartbeat at least every ~20 seconds during thinking stretches.
 
 Interpretation rules:
 
-- **Do not kill or abandon a run that is emitting progress lines or heartbeats — it is healthy.** Typical durations: standard review 2–8 min, deep review 5–15 min, advisory 1–6 min (longer for big diffs or `max` effort).
-- Silence for more than ~60 seconds is abnormal; only then check on it. The script itself flags a job as `possibly stalled` in `status` after 5 minutes without any model events (its own heartbeats don't count as activity).
+- **Do not kill or abandon a run that is emitting progress lines or heartbeats — it is healthy.** Typical durations: standard review 2–8 min, deep review 5–15 min, advisory 1–6 min, `both` roughly the longer of the two plus a merge pass.
+- Silence for more than ~60 seconds is abnormal; only then check on it. `status` flags a job as `possibly stalled` after 5 minutes without model events.
 - If your execution harness has a command timeout shorter than ~15 minutes, run with `--background` instead of stretching the timeout.
 
 ## Foreground vs background
 
-- Small change (1–3 files) or a quick advisory question → run in the foreground and wait; relay the streamed progress if your harness shows it.
-- Anything larger, unclear size, or `--deep` → run in the background.
+- Small change (1–3 files) or a quick advisory question → foreground; relay the streamed progress if your harness shows it.
+- Anything larger, `--deep`, or `--via both` → background.
 
 Background options (either works):
 
@@ -75,28 +93,26 @@ Background options (either works):
 2. Or use the built-in job runner:
 
 ```bash
-node "<skill-dir>/scripts/fable-check.mjs" review --background     # or: ask --background "..."
-node "<skill-dir>/scripts/fable-check.mjs" status                  # live progress: phase, elapsed, tool calls, last activity
-node "<skill-dir>/scripts/fable-check.mjs" result                  # final report (latest job)
-node "<skill-dir>/scripts/fable-check.mjs" cancel                  # stop an active job
+node "<skill-dir>/scripts/cross-check.mjs" review --background     # or: ask --background "..."
+node "<skill-dir>/scripts/cross-check.mjs" status                  # live progress: phase, elapsed, tool calls, last activity
+node "<skill-dir>/scripts/cross-check.mjs" result                  # final report (latest job)
+node "<skill-dir>/scripts/cross-check.mjs" cancel                  # stop an active job
 ```
 
-`status` on a running job shows elapsed time, current phase, tool-call count, the last activity with its age, and an explicit healthy/possibly-stalled verdict — poll it every 30–60 seconds. You can also `tail -f` the job's log file (path shown at launch and in `status`).
-
-When you launch a background job, tell the user the job id and that they can ask for status/results at any time.
+`status` on a running job shows elapsed time, current phase, tool-call count, the last activity with its age, and a healthy/possibly-stalled verdict — poll it every 30–60 seconds. When you launch a background job, tell the user the job id and that they can ask for status/results at any time.
 
 ## Setup / troubleshooting
 
-If a run fails because the `claude` CLI is missing or logged out:
+If a run fails because a CLI is missing or logged out:
 
 ```bash
-node "<skill-dir>/scripts/fable-check.mjs" setup
+node "<skill-dir>/scripts/cross-check.mjs" setup
 ```
 
-It reports what is missing and the exact next step (installing Claude Code or logging in). Runs use the user's existing Claude subscription — no API key is needed.
+It checks both `claude` and `codex`, their logins, and reports the detected routing with the exact next step. Runs use the user's existing subscriptions — no API keys.
 
 ## Notes
 
 - For reviews there must be something to review: uncommitted changes, or commits ahead of the base branch. If the script reports nothing to review, relay that — do not invent a review. (`ask` has no such requirement.)
-- Reports and answers are saved under `~/.fable-check/jobs/<repo>/` and each includes a `claude -r <session-id>` command to reopen the session interactively.
-- Focus text is most effective with `--adversarial`; the standard review intentionally takes no steering so its judgment stays neutral. For steered questions, prefer `ask`.
+- Every report header names the reviewer(s), model and effort. Reports are saved under `~/.cross-check/jobs/<repo>/` and include a resume command per reviewer (`claude -r <id>` / `codex exec resume <id>`).
+- Focus text is most effective with `--adversarial`; the standard review takes no steering so its judgment stays neutral. For steered questions, prefer `ask`.
