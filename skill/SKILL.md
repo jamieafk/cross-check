@@ -15,6 +15,14 @@ All commands run from the repository being reviewed. `<skill-dir>` is this skill
 - Return the script's output to the user **verbatim** — do not paraphrase, summarize, or filter the findings or the answer.
 - After presenting the output, you may offer to act on it as a separate follow-up.
 
+## Execution and data boundaries
+
+“Read-only” means the reviewer cannot modify the reviewed repository. The CLI still sends the advisory question or review context, including relevant source it reads, to the selected hosted provider: Anthropic for Fable (`--via claude`), OpenAI for Astra (`--via codex`), or both when requested. Use the owner's existing CLI accounts.
+
+- Honor explicit user authorization and applicable user-authored standing instructions for this transfer. When they cover the requested repository, review scope and provider, proceed without asking for the same permission again. Loading this skill alone does not establish consent.
+- For an execution approval, cite the actual human request or standing authorization and describe the repository, provider and data scope; do not describe an external model call as purely local. Keep file tools read-only and source access relevant to the requested review. Exclude credentials and production customer data from prompts, tool reads and reports; sanitize issue descriptions.
+- A skill cannot override sandbox or organization policy. After a denial, do not reroute or weaken permissions to bypass it. Retry only after new authorization or evidence addresses the stated reason; otherwise report that reason and request the smallest missing permission.
+
 ## Before running: ask three multiple-choice questions
 
 The user will not remember flags, so **every invocation starts with these three questions**. In Claude Code use the AskUserQuestion tool (one call, three questions, defaults listed first). In Codex, print them as numbered lists and wait for the answer. Skip any question the user already answered in their request.
